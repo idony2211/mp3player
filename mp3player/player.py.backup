@@ -1,0 +1,2839 @@
+import os
+import subprocess
+import time
+import json
+import socket
+import logging
+import re
+import io
+import wave
+from typing import Optional, List, Dict, Any
+import numpy as np
+
+import tkinter as tk
+from tkinter import filedialog, ttk
+import tkinter.messagebox as tkmsg
+
+from .constants import *
+from .marker_manager import MarkerManager
+from .playback import PlaybackController
+from .gui import GUIController
+from .segment import SegmentManager
+from .segment_player import SegmentPlayer
+
+logger = logging.getLogger(__name__)
+
+
+class MP3Player:
+    def __init__(self) -> None:
+        # Initialize components
+        self.marker_manager = MarkerManager(self)
+        self.segment_manager = SegmentManager(self.marker_manager)
+        self.segment_player = SegmentPlayer(self, self.segment_manager)
+        self.playback_controller = PlaybackController(self)
+        self.gui_controller = GUIController(self)
+
+        # Core attributes
+        self.current_file: Optional[str] = None
+        self.is_playing: bool = False
+        self.fast_forward_seconds: List[int] = [
+            1,
+            5,
+            10,
+        ]  # Available fast forward amounts
+        self.timer_id: Optional[str] = None
+        self.current_pos: float = 0.0
+        self.duration: float = 0.0
+
+        # No longer using waveform display
+        self.audio_waveform: Optional[np.ndarray] = None
+        self.waveform_samples: int = WAVEFORM_SAMPLES
+        self.user_interacting: bool = False  # No longer used since we removed waveform
+
+        # Loop functionality for segment playback
+        self.loop_count: int = 1  # Number of times to loop segment playback
+        self.current_loop: int = 0  # Current loop number during playback
+
+        # Logging frequency control
+        self.last_status_log_time: float = 0.0  # Timestamp of last status log
+        self.status_log_interval: float = 10.0  # Log status every 10 seconds
+
+        # Auto-save functionality
+        self.auto_save_timer_id: Optional[str] = None  # Timer ID for auto-save
+        self.auto_save_interval: int = (
+            60000  # Auto-save interval in milliseconds (60 seconds)
+        )
+        self.default_auto_save_interval: int = 60000  # Default interval (60 seconds)
+
+        # Initialize the GUI
+        self.setup_gui()
+
+        # Set initial window size to 1600x860 to provide more space for segment names
+        self.root.geometry("1600x860")
+
+    def setup_gui(self) -> None:
+        # This is now handled by the GUIController
+        pass
+
+    def on_canvas_click(self, event: tk.Event) -> None:
+        """Handle click on the progress canvas for seeking."""
+        logger.info(f"Progress canvas clicked at x={event.x}, y={event.y}")
+        if not self.current_file or self.duration <= 0:
+            return
+
+        # Get canvas dimensions
+        canvas_width, canvas_height = get_canvas_dimensions(self.progress_canvas)
+
+        # Calculate the clicked position as a percentage of the total duration
+        percent = max(0, min(100, (event.x / canvas_width) * 100))
+
+        # Convert percentage to time
+        new_pos = (percent / 100) * self.duration
+
+        # Check if we're in segment mode and clicked outside segment range
+        if (
+            hasattr(self.playback_controller, "segment_enabled")
+            and self.playback_controller.segment_enabled
+            and hasattr(self.playback_controller, "segment_start")
+            and hasattr(self.playback_controller, "segment_end")
+            and self.playback_controller.segment_start
+            < self.playback_controller.segment_end
+        ):
+            if (
+                new_pos < self.playback_controller.segment_start
+                or new_pos > self.playback_controller.segment_end
+            ):
+                logger.info(
+                    "Clicked outside segment range, exiting segment playback mode"
+                )
+                if hasattr(self.playback_controller, "is_in_segment_playback"):
+                    self.playback_controller.is_in_segment_playback = False
+                if hasattr(self, "segment_play_button"):
+                    self.segment_play_button.config(text="Play Segment")
+                self.status_label.config(
+                    text="Exited segment mode. Clicked outside segment range."
+                )
+
+        # If the mpv process is not running, start it
+        should_restart = (
+            not self.playback_controller.process
+            or self.playback_controller.process.poll() is not None
+        )
+
+        if should_restart:
+            logger.info("MPV process not running, starting it before seeking")
+            self.playback_controller.start_playback()
+            time.sleep(1.5)  # Wait for process to fully start and be ready
+
+            # If we just started the process, wait a bit more for it to fully load the file
+            # before attempting to seek to a position
+            time.sleep(0.5)
+
+        # Check if the clicked position is close to an existing marker (within tolerance)
+        marker_clicked = None
+        tolerance = 0.5  # Half second tolerance
+        for i, marker in enumerate(self.marker_manager.markers):
+            if abs(marker["time"] - new_pos) <= tolerance:
+                marker_clicked = i
+                break
+
+        if marker_clicked is not None:
+            # If a marker was clicked, select it in the listbox and highlight it
+            clicked_marker = self.marker_manager.markers[marker_clicked]
+            logger.info(
+                f"Clicked on marker {clicked_marker['name']} at {self.format_time(clicked_marker['time'])}"
+            )
+            self.status_label.config(
+                text=f"Clicked on marker {clicked_marker['name']}, use time controls to edit"
+            )
+
+            # Set the selected marker index
+            self.marker_manager.selected_marker_index = marker_clicked
+
+            # Update the marker list to reflect selection
+            self.marker_manager.update_marker_list()
+
+            # Select the marker in the listbox
+            if (
+                self.marker_manager.selected_marker_index is not None
+                and self.marker_manager.selected_marker_index
+                < self.marker_listbox.size()
+            ):
+                self.marker_listbox.selection_clear(
+                    0, tk.END
+                )  # Clear any existing selection
+                self.marker_listbox.selection_set(
+                    self.marker_manager.selected_marker_index
+                )  # Select the clicked marker
+                self.marker_listbox.see(
+                    self.marker_manager.selected_marker_index
+                )  # Ensure it's visible
+
+            # Clear the preview marker time when clicking on the timeline
+            if hasattr(self, "_preview_marker_time"):
+                delattr(self, "_preview_marker_time")
+
+            # Update the display to highlight the selected marker
+            self.redraw_progress_display()
+
+            # Also seek to the marker's position
+            marker_time = clicked_marker["time"]
+            new_pos = (
+                marker_time  # Use the exact marker time instead of the clicked position
+            )
+
+            # Seek to the marker's position
+            logger.info(f"Seeking to marker position: {self.format_time(marker_time)}")
+            # Send seek command via IPC
+            response = self.playback_controller.send_command(
+                {"command": ["seek", marker_time, "absolute"]}
+            )
+            logger.info(f"Canvas click seek response: {response}")
+
+            self.current_pos = marker_time
+
+            self.update_time_display()
+            self.redraw_progress_display()
+
+            # Populate the "Jump to" time fields with the current playback time
+            self._populate_jump_entries(self.current_pos)
+
+            # Save the current position after canvas click seeking
+            self.save_marker_data()
+            # Schedule the next auto-save
+            self.schedule_next_auto_save()
+
+    def on_canvas_right_click(self, event: tk.Event) -> None:
+        """Handle right-click on the progress canvas to set marker time."""
+        logger.info(f"Progress canvas right-clicked at x={event.x}, y={event.y}")
+        if not self.current_file or self.duration <= 0:
+            return
+
+        # Get canvas dimensions
+        canvas_width, canvas_height = get_canvas_dimensions(self.progress_canvas)
+
+        # Calculate the clicked position as a percentage of the total duration
+        percent = max(0, min(100, (event.x / canvas_width) * 100))
+
+        # Convert percentage to time
+        clicked_time = (percent / 100) * self.duration
+
+        # Update the time input fields with the clicked time
+        total_seconds = int(clicked_time)
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        milliseconds = int((clicked_time - total_seconds) * 1000)
+
+        self.marker_minute_entry.delete(0, tk.END)
+        self.marker_minute_entry.insert(0, str(minutes))
+
+        self.marker_second_entry.delete(0, tk.END)
+        self.marker_second_entry.insert(0, str(seconds))
+
+        self.marker_millisecond_entry.delete(0, tk.END)
+        self.marker_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+        # Update the status to inform the user
+        self.status_label.config(
+            text=f"Marker time set to {self.format_time(clicked_time)} via right-click"
+        )
+
+        # Set the preview marker time to show the selected time on the timeline
+        self._preview_marker_time = clicked_time
+
+        # Update the display to reflect the new time
+        self.redraw_progress_display()
+
+    def on_canvas_double_click(self, event: tk.Event) -> None:
+        """Handle double-click on the progress canvas for seeking."""
+        logger.info(f"Progress canvas double-clicked at x={event.x}, y={event.y}")
+        if not self.current_file or self.duration <= 0:
+            return
+
+        canvas_width, canvas_height = get_canvas_dimensions(self.progress_canvas)
+
+        percent = max(0, min(100, (event.x / canvas_width) * 100))
+        new_pos = (percent / 100) * self.duration
+
+        should_restart = (
+            not self.playback_controller.process
+            or self.playback_controller.process.poll() is not None
+        )
+
+        if should_restart:
+            logger.info("MPV process not running, starting it before seeking")
+            self.playback_controller.start_playback()
+            time.sleep(1.5)
+            time.sleep(0.5)
+
+        logger.info(f"Seeking to double-click position: {self.format_time(new_pos)}")
+        response = self.playback_controller.send_command(
+            {"command": ["seek", new_pos, "absolute"]}
+        )
+        logger.info(f"Canvas double-click seek response: {response}")
+
+        self.current_pos = new_pos
+
+        self.update_time_display()
+        self.redraw_progress_display()
+        self._populate_jump_entries(self.current_pos)
+
+        self.save_marker_data()
+        self.schedule_next_auto_save()
+
+    def on_canvas_click_marker_select(self, event: tk.Event) -> None:
+        """Handle click on the progress canvas for marker selection only (no seeking)."""
+        logger.info(
+            f"Progress canvas clicked for marker selection at x={event.x}, y={event.y}"
+        )
+        if not self.current_file or self.duration <= 0:
+            return
+
+        # Get canvas dimensions
+        canvas_width, canvas_height = get_canvas_dimensions(self.progress_canvas)
+
+        # Calculate the clicked position as a percentage of the total duration
+        percent = max(0, min(100, (event.x / canvas_width) * 100))
+
+        # Convert percentage to time
+        clicked_time = (percent / 100) * self.duration
+
+        # Check if the clicked position is close to an existing marker (within tolerance)
+        marker_clicked = None
+        tolerance = 0.5  # Half second tolerance
+        for i, marker in enumerate(self.marker_manager.markers):
+            if abs(marker["time"] - clicked_time) <= tolerance:
+                marker_clicked = i
+                break
+
+        if marker_clicked is not None:
+            # If a marker was clicked, select it in the listbox and highlight it
+            clicked_marker = self.marker_manager.markers[marker_clicked]
+            logger.info(
+                f"Clicked on marker {clicked_marker['name']} at {self.format_time(clicked_marker['time'])}"
+            )
+            self.status_label.config(
+                text=f"Clicked on marker {clicked_marker['name']}, use time controls to edit"
+            )
+
+            # Set the selected marker index
+            self.marker_manager.selected_marker_index = marker_clicked
+
+            # Update the marker list to reflect selection
+            self.marker_manager.update_marker_list()
+
+            # Select the marker in the listbox
+            if (
+                self.marker_manager.selected_marker_index is not None
+                and self.marker_manager.selected_marker_index
+                < self.marker_listbox.size()
+            ):
+                self.marker_listbox.selection_clear(
+                    0, tk.END
+                )  # Clear any existing selection
+                self.marker_listbox.selection_set(
+                    self.marker_manager.selected_marker_index
+                )  # Select the clicked marker
+                self.marker_listbox.see(
+                    self.marker_manager.selected_marker_index
+                )  # Ensure it's visible
+
+            # Populate time input fields with the selected marker's time
+            total_seconds = int(clicked_marker["time"])
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            milliseconds = int((clicked_marker["time"] - total_seconds) * 1000)
+
+            self.marker_minute_entry.delete(0, tk.END)
+            self.marker_minute_entry.insert(0, str(minutes))
+
+            self.marker_second_entry.delete(0, tk.END)
+            self.marker_second_entry.insert(0, str(seconds))
+
+            self.marker_millisecond_entry.delete(0, tk.END)
+            self.marker_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+            # Clear the preview marker time when a marker is clicked on the timeline
+            if hasattr(self, "_preview_marker_time"):
+                delattr(self, "_preview_marker_time")
+
+            # Update the display to highlight the selected marker
+            self.redraw_progress_display()
+        else:
+            # No marker was clicked, set preview marker at clicked position
+            logger.info(
+                f"Clicked on blank space at {self.format_time(clicked_time)}, setting preview marker"
+            )
+            self.status_label.config(
+                text=f"Preview marker set at {self.format_time(clicked_time)}. Click 'Add Marker' to confirm."
+            )
+
+            self._preview_marker_time = clicked_time
+
+            total_seconds = int(clicked_time)
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            milliseconds = int((clicked_time - total_seconds) * 1000)
+
+            self.marker_minute_entry.delete(0, tk.END)
+            self.marker_minute_entry.insert(0, str(minutes))
+
+            self.marker_second_entry.delete(0, tk.END)
+            self.marker_second_entry.insert(0, str(seconds))
+
+            self.marker_millisecond_entry.delete(0, tk.END)
+            self.marker_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+            # Clear any selections
+            self.marker_manager.selected_marker_index = None
+            self.marker_listbox.selection_clear(0, tk.END)
+
+            # Update the display to show the preview marker
+            self.redraw_progress_display()
+
+    def on_left_arrow(self) -> None:
+        logger.info("Left arrow key pressed (rewind 5s)")
+        self.rewind(5)
+
+    def on_right_arrow(self) -> None:
+        logger.info("Right arrow key pressed (fast forward 5s)")
+        self.fast_forward(5)
+
+    def on_ctrl_left_arrow(self) -> None:
+        logger.info("Ctrl+Left arrow key pressed (rewind 10s)")
+        self.rewind(10)
+
+    def on_ctrl_right_arrow(self) -> None:
+        logger.info("Ctrl+Right arrow key pressed (fast forward 10s)")
+        self.fast_forward(10)
+
+    def on_shift_left_arrow(self) -> None:
+        logger.info("Shift+Left arrow key pressed (rewind 1s)")
+        self.rewind(1)
+
+    def on_shift_right_arrow(self) -> None:
+        logger.info("Shift+Right arrow key pressed (fast forward 1s)")
+        self.fast_forward(1)
+
+    def jump_to_next_segment(self) -> None:
+        """Jump to the beginning of the next segment."""
+        next_segment = self.segment_manager.get_next_segment(self.current_pos)
+        self._jump_to_segment(next_segment, "next")
+
+    def jump_to_previous_segment(self) -> None:
+        """Jump to the beginning of the previous segment."""
+        prev_segment = self.segment_manager.get_previous_segment(self.current_pos)
+        self._jump_to_segment(prev_segment, "previous")
+
+    def _jump_to_segment(self, segment: "Segment", direction: str) -> None:
+        """Helper method to jump to a segment."""
+        if not self.current_file:
+            logger.warning(f"No file loaded, cannot jump to {direction} segment")
+            self.status_label.config(text="No file loaded")
+            return
+
+        if not segment:
+            self.status_label.config(f"No {direction} segment found")
+            return
+
+        logger.info(
+            f"Jumping to {direction} segment at {self.format_time(segment.start_time)}"
+        )
+        response = self.playback_controller.send_command_with_retry(
+            {"command": ["seek", segment.start_time, "absolute"]}
+        )
+        logger.info(f"Seek to {direction} segment response: {response}")
+
+        self.current_pos = segment.start_time
+        self.update_time_display()
+        self.redraw_progress_display()
+
+        self.segment_player.selected_segment_index = segment.index
+
+        if hasattr(self, "segment_listbox"):
+            self.segment_listbox.selection_clear(0, tk.END)
+            self.segment_listbox.selection_set(segment.index)
+            self.segment_listbox.see(segment.index)
+
+        self.status_label.config(
+            text=f"Jumped to segment {segment.index + 1} of {self.segment_manager.get_segment_count()}"
+        )
+
+    def on_segment_select(self, event: tk.Event) -> None:
+        """Handle segment selection in the listbox."""
+        selection = self.segment_listbox.curselection()
+        if selection:
+            first_idx = selection[0]
+
+            self.segment_player.selected_segment_index = first_idx
+            self.segment_player.seg_current_pos = 0.0
+            segment = self.segment_manager.get_segment_by_index(first_idx)
+
+            if segment:
+                self._update_segment_timeline_label(first_idx)
+                if len(selection) == 1:
+                    segment_name = f"Segment {first_idx + 1}: {self.format_time(segment.start_time)} - {self.format_time(segment.end_time)}"
+                    self.transcription_segment_label.set(segment_name)
+                    self.status_label.config(
+                        text=f"Selected segment {segment.index + 1}: {self.format_time(segment.start_time)} - {self.format_time(segment.end_time)}"
+                    )
+                else:
+                    self.status_label.config(
+                        text=f"Selected {len(selection)} segments: {selection[0] + 1} to {selection[-1] + 1}"
+                    )
+
+                if self.segment_player.segment_paused_selection is not None:
+                    self.segment_player.segment_paused_selection = None
+                    self.segment_player.segment_paused_position = None
+
+                if (
+                    self.segment_player.is_active
+                    and self.segment_player.segment_is_playing
+                ):
+                    self.segment_player._seek_to(segment.start_time)
+                    self.segment_player.current_segment_index = 0
+                    self.segment_player.selected_segments_to_play = [segment]
+                    self.segment_player._monitor_playback()
+
+                self.redraw_progress_display()
+                self.update_segment_time_display()
+                self.update_segment_absolute_time_display()
+                self.load_transcription_for_segment()
+
+    def _update_segment_timeline_label(self, segment_idx: int) -> None:
+        """Update the segment timeline label to show current segment."""
+        if not hasattr(self, "segment_timeline_label_var"):
+            return
+        segment = self.segment_manager.get_segment_by_index(segment_idx)
+        if segment:
+            self.segment_timeline_label_var.set(
+                f"Segment Timeline: Segment {segment.index + 1}"
+            )
+        else:
+            self.segment_timeline_label_var.set("Segment Timeline:")
+
+    def on_segment_time_canvas_click(self, event: tk.Event) -> None:
+        """Handle click on the segment time canvas for seeking within the selected segment."""
+        logger.info(f"Segment time canvas clicked at x={event.x}, y={event.y}")
+
+        if not self.current_file or self.duration <= 0:
+            return
+
+        # Get the currently selected segment
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.status_label.config(text="Please select a segment first")
+            return
+
+        selected_idx = selection[0]
+        selected_segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if not selected_segment:
+            logger.warning(f"Segment at index {selected_idx} not found")
+            return
+
+        # Get canvas dimensions
+        canvas_width = self.segment_time_canvas.winfo_width()
+        if canvas_width <= 1:
+            canvas_width = 400  # Default width when canvas isn't fully rendered yet
+
+        # Calculate the clicked position as a percentage of the segment duration
+        percent = max(0, min(100, (event.x / canvas_width) * 100))
+
+        # Convert percentage to time within the segment
+        segment_time = (percent / 100) * selected_segment.duration
+        new_pos = selected_segment.start_time + segment_time
+
+        if not (hasattr(self, "segment_player") and self.segment_player.is_active):
+            # If the mpv process is not running, start it
+            should_restart = (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            )
+            if should_restart:
+                logger.info("MPV process not running, starting it before seeking")
+                self.playback_controller.start_playback()
+                time.sleep(1.5)  # Wait for process to be ready
+
+            logger.info(f"Seeking to position: {self.format_time(new_pos)}")
+            response = self.playback_controller.send_command(
+                {"command": ["seek", new_pos, "absolute"]}
+            )
+            logger.info(f"Seek response: {response}")
+            self.current_pos = new_pos
+        else:
+            # Segment player active
+            # If the mpv process is not running, start it
+            should_restart = (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            )
+            if should_restart:
+                logger.info("MPV process not running, starting it before seeking")
+                self.playback_controller.start_playback()
+                time.sleep(1.5)
+
+            # Seek to the position (both playing and paused)
+            logger.info(
+                f"Seeking to segment time position: {self.format_time(new_pos)}"
+            )
+            response = self.playback_controller.send_command(
+                {"command": ["seek", new_pos, "absolute"]}
+            )
+            logger.info(f"Segment time canvas click seek response: {response}")
+
+            # Get actual position after seek to update seg_current_pos
+            time.sleep(0.1)
+            pos_response = self.playback_controller.send_command(
+                {"command": ["get_property", "time-pos"]}
+            )
+            if (
+                pos_response
+                and "data" in pos_response
+                and pos_response["data"] is not None
+            ):
+                actual_pos = pos_response["data"]
+                self.segment_player.seg_current_pos = (
+                    actual_pos - selected_segment.start_time
+                )
+                logger.info(
+                    f"Updated seg_current_pos to {self.segment_player.seg_current_pos:.3f}s (actual: {self.format_time(actual_pos)})"
+                )
+
+            if not self.segment_player.segment_is_playing:
+                self.segment_player.segment_paused_position = new_pos
+
+        self.update_time_display()
+        self.redraw_progress_display()
+        self.update_segment_time_display()
+
+    def toggle_segment_play_pause(self) -> None:
+        """Toggle between playing and pausing the current segment or selected segments."""
+        self.segment_player.toggle_play_pause()
+
+    def apply_repeat_settings(self) -> None:
+        """Apply repeat settings from UI entries."""
+        self.segment_player.apply_repeat_settings()
+
+    def toggle_segment_player(self) -> None:
+        """Toggle the segment player between active and inactive states."""
+        if self.segment_player.is_active:
+            self.segment_player.deactivate()
+            self._enable_main_controls()
+            self.segment_player_toggle_button.config(text="Activate Segment Player")
+        else:
+            self.segment_player.activate()
+            self._disable_main_controls()
+            self.segment_player_toggle_button.config(text="Deactivate Segment Player")
+
+    def _disable_main_controls(self) -> None:
+        """Disable the main playback controls in the UI."""
+        if hasattr(self, "play_button"):
+            self.play_button.config(state="disabled")
+        if hasattr(self, "rewind_buttons"):
+            for btn in self.rewind_buttons:
+                btn.config(state="disabled")
+        if hasattr(self, "fast_forward_buttons"):
+            for btn in self.fast_forward_buttons:
+                btn.config(state="disabled")
+        if hasattr(self, "file_button"):
+            self.file_button.config(state="disabled")
+
+    def _enable_main_controls(self) -> None:
+        """Re-enable the main playback controls in the UI."""
+        if hasattr(self, "play_button"):
+            self.play_button.config(state="normal")
+        if hasattr(self, "rewind_buttons"):
+            for btn in self.rewind_buttons:
+                btn.config(state="normal")
+        if hasattr(self, "fast_forward_buttons"):
+            for btn in self.fast_forward_buttons:
+                btn.config(state="normal")
+        if hasattr(self, "file_button"):
+            self.file_button.config(state="normal")
+
+    def update_segment_list(self) -> None:
+        """Update the segment listbox with current segments."""
+        try:
+            # Store the currently selected index to restore it after updating
+            current_selection = self.segment_listbox.curselection()
+
+            self.segment_listbox.delete(0, tk.END)
+            segments = self.segment_manager.get_segments()
+            logger.info(f"Updating segment list with {len(segments)} segments")
+
+            # Get sorted markers to match segments with their corresponding markers
+            sorted_markers = sorted(
+                self.marker_manager.markers, key=lambda m: m["time"]
+            )
+
+            for i, segment in enumerate(segments):
+                # Calculate the total seconds for the duration with 3 decimal places
+                total_seconds = round(segment.duration, 3)
+
+                # Find the start and end markers for this segment
+                start_marker_name = "Unknown"
+                end_marker_name = "Unknown"
+
+                # Find the start marker
+                for marker in sorted_markers:
+                    if (
+                        abs(marker["time"] - segment.start_time) < 0.01
+                    ):  # Tolerance of 0.01 seconds
+                        start_marker_name = marker["name"]
+                        break
+
+                # Find the end marker
+                for marker in sorted_markers:
+                    if (
+                        abs(marker["time"] - segment.end_time) < 0.01
+                    ):  # Tolerance of 0.01 seconds
+                        end_marker_name = marker["name"]
+                        break
+
+                # Format the display text according to the requested format
+                display_text = f"segment {i + 1}:{start_marker_name}-{end_marker_name}({self.format_time(segment.start_time)} To {self.format_time(segment.end_time)},L:{total_seconds:.3f}S)"
+                logger.info(f"Adding segment {i}: {display_text}")
+                self.segment_listbox.insert(tk.END, display_text)
+
+            # Restore the selection if there was one
+            if current_selection and current_selection[0] < self.segment_listbox.size():
+                self.segment_listbox.selection_set(current_selection[0])
+
+            # Update the segment time display to reflect the current selection
+            self.update_segment_time_display()
+        except Exception as e:
+            logger.error(f"Error updating segment list: {e}")
+            self.segment_listbox.delete(0, tk.END)  # Clear anyway
+            segments = self.segment_manager.get_segments()
+
+            # Get sorted markers to match segments with their corresponding markers
+            sorted_markers = sorted(
+                self.marker_manager.markers, key=lambda m: m["time"]
+            )
+
+            for i, segment in enumerate(segments):
+                # Calculate the total seconds for the duration with 3 decimal places
+                total_seconds = round(segment.duration, 3)
+
+                # Find the start and end markers for this segment
+                start_marker_name = "Unknown"
+                end_marker_name = "Unknown"
+
+                # Find the start marker
+                for marker in sorted_markers:
+                    if (
+                        abs(marker["time"] - segment.start_time) < 0.01
+                    ):  # Tolerance of 0.01 seconds
+                        start_marker_name = marker["name"]
+                        break
+
+                # Find the end marker
+                for marker in sorted_markers:
+                    if (
+                        abs(marker["time"] - segment.end_time) < 0.01
+                    ):  # Tolerance of 0.01 seconds
+                        end_marker_name = marker["name"]
+                        break
+
+                # Format the display text according to the requested format
+                display_text = f"segment {i + 1}:{start_marker_name}-{end_marker_name}({self.format_time(segment.start_time)} To {self.format_time(segment.end_time)},L:{total_seconds:.3f}S)"
+                self.segment_listbox.insert(tk.END, display_text)
+
+            # Update the segment time display even in error case
+            self.update_segment_time_display()
+
+    def key_load_file(self) -> None:
+        logger.info("O key pressed - triggering file load")
+        self.load_file()
+
+    def set_speed(self, speed: float) -> None:
+        """Set the playback speed."""
+        logger.info(f"Setting playback speed to {speed}x")
+
+        if self.current_file:
+            # Send speed command via IPC
+            response = self.playback_controller.send_command(
+                {"command": ["set_property", "speed", speed]}
+            )
+            logger.info(f"Speed command response: {response}")
+
+            # Update the current speed display
+            self.current_speed_label.config(text=f"{speed}x")
+
+            # Update status to show current speed
+            self.status_label.config(text=f"Speed set to {speed}x")
+
+    def validate_time_input(self, event: Optional[tk.Event] = None) -> None:
+        """Validate that input is numeric only and within proper ranges."""
+        if event is None:  # If no event, exit early
+            return
+
+        # Log time input validation
+        widget = event.widget
+        current_text = widget.get()
+        logger.info(f"Time input validation triggered on {widget}: '{current_text}'")
+
+        # Filter out non-numeric characters
+        new_text = "".join(char for char in current_text if char.isdigit())
+
+        # Apply limits based on the field
+        if widget == self.jump_minute_entry:
+            # Minutes can be anything, but keep it reasonable (though no strict limit needed)
+            pass
+        elif widget == self.jump_second_entry:
+            # Limit seconds to 0-59
+            if new_text:
+                sec_val = int(new_text)
+                if sec_val > 59:
+                    new_text = "59"
+                elif sec_val < 0:
+                    new_text = "0"
+        elif widget == self.jump_millisecond_entry:
+            # Limit milliseconds to 0-999
+            if new_text:
+                ms_val = int(new_text)
+                if ms_val > 999:
+                    new_text = "999"
+                elif ms_val < 0:
+                    new_text = "0"
+
+        # If text is different, update the entry
+        if current_text != new_text:
+            logger.info(f"Time input corrected from '{current_text}' to '{new_text}'")
+            widget.delete(0, tk.END)
+            widget.insert(0, new_text)
+
+    def redraw_progress_display(self):
+        """Redraw the progress bar without zoom functionality."""
+        # Clear the canvas
+        self.progress_canvas.delete("all")
+
+        # Get canvas dimensions
+        canvas_width, canvas_height = get_canvas_dimensions(self.progress_canvas)
+
+        # Draw the progress bar based on current position as percentage of total duration
+        if self.duration > 0:
+            # Calculate progress as percentage of total duration
+            progress_percent = (
+                self.current_pos / self.duration if self.duration > 0 else 0
+            )
+            progress_width = progress_percent * canvas_width
+
+            # Draw the background track
+            self.progress_canvas.create_rectangle(
+                0,
+                0,
+                canvas_width,
+                canvas_height,
+                fill=CANVAS_BG,
+                outline=CANVAS_OUTLINE,
+            )
+
+            # Draw segments as background regions
+            segments = self.segment_manager.get_segments()
+            selected_indices = set()
+            if hasattr(self, "segment_listbox"):
+                selection = self.segment_listbox.curselection()
+                if selection:
+                    selected_indices = set(selection)
+
+            for segment in segments:
+                segment_start_x = (segment.start_time / self.duration) * canvas_width
+                segment_end_x = (segment.end_time / self.duration) * canvas_width
+
+                # Check if this segment is selected
+                is_selected = segment.index in selected_indices
+
+                if is_selected:
+                    # Highlight selected segments with a different color
+                    segment_color = "#CCE5FF"  # Light blue for selected segment
+                    # Draw a border around selected segment
+                    self.progress_canvas.create_rectangle(
+                        segment_start_x,
+                        0,
+                        segment_end_x,
+                        canvas_height,
+                        fill=segment_color,
+                        outline="#0066CC",
+                        width=2,
+                    )
+                else:
+                    # Alternate segment colors to make them visually distinct
+                    segment_color = "#F0F8FF" if segment.index % 2 == 0 else "#E6F3FF"
+                    # Draw segment background normally
+                    self.progress_canvas.create_rectangle(
+                        segment_start_x,
+                        0,
+                        segment_end_x,
+                        canvas_height,
+                        fill=segment_color,
+                        outline="#B0D4FF",
+                        stipple="gray25",
+                    )
+
+                # Add segment number in the middle of each segment
+                segment_center_x = (segment_start_x + segment_end_x) / 2
+                self.progress_canvas.create_text(
+                    segment_center_x,
+                    canvas_height / 2,
+                    text=f"s{segment.index + 1}",
+                    font=("TkDefaultFont", 8),
+                    fill="#666666",
+                    anchor="center",
+                )
+
+            # Draw the segment range if enabled (for segment playback)
+            if (
+                hasattr(self.playback_controller, "segment_enabled")
+                and self.playback_controller.segment_enabled
+                and hasattr(self.playback_controller, "segment_start")
+                and hasattr(self.playback_controller, "segment_end")
+                and self.playback_controller.segment_start
+                < self.playback_controller.segment_end
+            ):
+                segment_start_x = (
+                    self.playback_controller.segment_start / self.duration
+                ) * canvas_width
+                segment_end_x = (
+                    self.playback_controller.segment_end / self.duration
+                ) * canvas_width
+                # Draw segment range background with different color to distinguish from regular segments
+                self.progress_canvas.create_rectangle(
+                    segment_start_x,
+                    0,
+                    segment_end_x,
+                    canvas_height,
+                    fill="#FFE6E6",
+                    outline="#FFB0B0",
+                    stipple="gray25",
+                )
+
+            # Calculate progress as percentage of total duration
+            progress_percent = (
+                self.current_pos / self.duration if self.duration > 0 else 0
+            )
+            progress_width = progress_percent * canvas_width
+
+            # Draw the progress indicator line
+            indicator_x = int(progress_percent * canvas_width)
+
+            if 0 <= indicator_x <= canvas_width:  # Only draw if within visible area
+                self.progress_canvas.create_line(
+                    indicator_x,
+                    0,
+                    indicator_x,
+                    canvas_height,
+                    width=3,
+                    fill=INDICATOR_COLOR,
+                    tag="progress_indicator",
+                )
+
+            # Draw markers after progress to ensure they're always visible
+            for i, marker in enumerate(self.marker_manager.markers):
+                marker_x = int((marker["time"] / self.duration) * canvas_width)
+
+                # Determine color based on marker type
+                if marker["name"] == "Marker0" or marker["name"] == "Marker100":
+                    # Use a different color for fixed markers
+                    marker_color = "#0066CC"  # Blue color for fixed markers
+                    line_width = 3  # Slightly thicker for fixed markers
+                else:
+                    # Use standard color for user-created markers
+                    marker_color = "#FFA500"  # Orange color
+                    line_width = 2
+
+                # Highlight the selected marker if there is one
+                if (
+                    self.marker_manager.selected_marker_index is not None
+                    and self.marker_manager.selected_marker_index == i
+                ):
+                    line_width = 6  # Thicker line for selected marker
+                    marker_color = "#00AA00"  # Green color for selected marker
+                else:
+                    # Increase the default line width to make markers easier to click
+                    if line_width < 4:  # Only increase if it's not already thick
+                        line_width = 4
+
+                # Draw a slightly wider line to make it easier to click
+                self.progress_canvas.create_line(
+                    marker_x,
+                    0,
+                    marker_x,
+                    canvas_height,
+                    width=line_width,
+                    fill=marker_color,
+                )
+
+                # Add marker number above the progress bar
+                # Extract number from marker name (e.g., "Marker0" -> "0", "Marker10" -> "10")
+                marker_name = marker["name"]
+                if marker_name.startswith("Marker"):
+                    marker_num = marker_name[6:]  # Get the number part after 'Marker'
+                else:
+                    marker_num = str(
+                        self.marker_manager.markers.index(marker) + 1
+                    )  # Fallback to index-based
+
+                self.progress_canvas.create_text(
+                    marker_x,
+                    -5,
+                    text=marker_num,
+                    font=("TkDefaultFont", 8),
+                    fill=marker_color,
+                    anchor="s",
+                )
+
+            # Calculate and draw the progress indicator line
+            # The indicator represents the current playback position on the canvas
+            main_progress_percent = (
+                self.current_pos / self.duration if self.duration > 0 else 0
+            )
+            indicator_x = int(main_progress_percent * canvas_width)
+
+            if 0 <= indicator_x <= canvas_width:  # Only draw if within visible area
+                self.progress_canvas.create_line(
+                    indicator_x,
+                    0,
+                    indicator_x,
+                    canvas_height,
+                    width=3,
+                    fill=INDICATOR_COLOR,
+                    tag="progress_indicator",
+                )
+
+            # Draw preview line for marker time if it exists
+            if hasattr(self, "_preview_marker_time") and self.duration > 0:
+                preview_percent = self._preview_marker_time / self.duration
+                preview_x = int(preview_percent * canvas_width)
+
+                if 0 <= preview_x <= canvas_width:  # Only draw if within visible area
+                    # Draw a blue line for the preview marker
+                    self.progress_canvas.create_line(
+                        preview_x,
+                        0,
+                        preview_x,
+                        canvas_height,
+                        width=2,
+                        fill="#0000FF",
+                        tag="preview_indicator",
+                    )
+
+            # Draw percentage markers (every 5% from 0% to 100%) - drawn last to be on top
+            for percent_marker in range(0, 101, 5):
+                marker_x = int((percent_marker / 100) * canvas_width)
+
+                # Draw small tick mark
+                if (
+                    percent_marker % 25 == 0
+                ):  # Draw longer ticks for 0%, 25%, 50%, 75%, 100%
+                    # Draw on top of the progress bar, using canvas coordinates that won't be obscured
+                    self.progress_canvas.create_line(
+                        marker_x, 0, marker_x, 8, width=1, fill="#666666"
+                    )
+
+                    # Add percentage text label above the progress bar
+                    if percent_marker == 100:
+                        # For 100%, align text to the right to make sure it's fully visible
+                        self.progress_canvas.create_text(
+                            marker_x,
+                            12,
+                            text=f"{percent_marker}%",
+                            font=("TkDefaultFont", 8),
+                            fill="#666666",
+                            anchor="e",
+                        )
+                    elif percent_marker in [0, 25, 50, 75]:
+                        # For other major marks, use centered text
+                        self.progress_canvas.create_text(
+                            marker_x,
+                            12,
+                            text=f"{percent_marker}%",
+                            font=("TkDefaultFont", 8),
+                            fill="#666666",
+                        )
+                else:  # Draw shorter ticks for other percentages
+                    self.progress_canvas.create_line(
+                        marker_x, 0, marker_x, 5, width=1, fill="#999999"
+                    )
+
+    def jump_to_time(self):
+        """Jump to a specific time entered in separate minute, second and millisecond fields."""
+        minute_str = self.jump_minute_entry.get().strip()
+        second_str = self.jump_second_entry.get().strip()
+        millisecond_str = self.jump_millisecond_entry.get().strip()
+
+        if not minute_str and not second_str and not millisecond_str:
+            logger.warning("No time entered in jump fields")
+            return
+
+        if not self.current_file:
+            logger.warning("No file loaded, cannot jump to time")
+            return
+
+        try:
+            # Parse minutes, seconds and milliseconds
+            minutes = int(minute_str) if minute_str else 0
+            seconds = int(second_str) if second_str else 0
+            milliseconds = int(millisecond_str) if millisecond_str else 0
+
+            # Calculate total seconds
+            total_seconds = minutes * 60 + seconds + milliseconds / 1000.0
+
+            # Check if requested time exceeds file duration
+            if self.duration > 0 and total_seconds > self.duration:
+                logger.warning(
+                    f"Requested jump time {total_seconds}s exceeds file duration {self.duration}s"
+                )
+                self.status_label.config(
+                    text=f"Time exceeds file length. Max: {self.format_time(self.duration)}"
+                )
+                return
+
+            # If the mpv process is not running or we're at the end of the file after completion, start it
+            # In some cases after playback finishes, MPV enters a state where it doesn't accept commands immediately
+            should_restart = (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            )
+
+            if should_restart:
+                logger.info(
+                    "MPV process not running or needs restart, starting it before seeking"
+                )
+                self.playback_controller.start_playback()
+                time.sleep(1.5)  # Wait for process to fully start and be ready
+
+                # If we just started the process, wait a bit more for it to fully load the file
+                # before attempting to seek to a position
+                time.sleep(0.5)
+
+            logger.info(
+                f"Jumping to time: {self.format_time(total_seconds)} ({minutes}m {seconds}s {milliseconds}ms)"
+            )
+
+            # Send seek command via IPC with retry logic
+            response = self.playback_controller.send_command_with_retry(
+                {"command": ["seek", total_seconds, "absolute"]}
+            )
+            logger.info(f"Jump to time response: {response}")
+
+            # Update current position
+            self.current_pos = total_seconds
+
+            # Clear the preview marker time when jumping to a time
+            if hasattr(self, "_preview_marker_time"):
+                delattr(self, "_preview_marker_time")
+
+            # Update progress display
+            self.redraw_progress_display()
+
+            # Update time display to show the new position immediately
+            self.update_time_display()
+
+            # Save the current position after seeking
+            self.save_marker_data()
+            # Schedule the next auto-save
+            self.schedule_next_auto_save()
+
+        except ValueError:
+            logger.error(
+                f"Invalid time format: minutes='{minute_str}', seconds='{second_str}', milliseconds='{millisecond_str}'. Enter numbers only."
+            )
+            self.status_label.config(text="Invalid time format. Enter numbers only.")
+        except Exception as e:
+            logger.error(f"Error jumping to time: {e}")
+            self.status_label.config(text=f"Error jumping to time: {e}")
+
+    def get_current_time(self) -> None:
+        """Get the current playback time and populate the marker time input fields."""
+        if not self.current_file:
+            logger.warning("No file loaded, cannot get current time")
+            self.status_label.config(text="No file loaded")
+            return
+
+        # Calculate minutes, seconds, and milliseconds from current position
+        total_seconds = int(self.current_pos)
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        milliseconds = int((self.current_pos - total_seconds) * 1000)
+
+        # Update the marker time input fields
+        self.marker_minute_entry.delete(0, tk.END)
+        self.marker_minute_entry.insert(0, str(minutes))
+
+        self.marker_second_entry.delete(0, tk.END)
+        self.marker_second_entry.insert(0, str(seconds))
+
+        self.marker_millisecond_entry.delete(0, tk.END)
+        self.marker_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+        # Update the preview marker time and redraw the display
+        self._preview_marker_time = self.current_pos
+        self.redraw_progress_display()
+
+        # Update status to inform the user
+        self.status_label.config(
+            text=f"Marker time set to current playback time: {self.format_time(self.current_pos)}"
+        )
+
+    def get_seg_current_time(self) -> None:
+        """Get the current segment absolute time and populate the marker time input fields."""
+        if not self.current_file:
+            logger.warning("No file loaded, cannot get segment current time")
+            self.status_label.config(text="No file loaded")
+            return
+
+        # Get the currently selected segment
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            logger.warning("No segment selected, cannot get segment current time")
+            self.status_label.config(text="No segment selected")
+            return
+
+        selected_idx = selection[0]
+        selected_segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if not selected_segment:
+            logger.warning("Selected segment not found")
+            self.status_label.config(text="Selected segment not found")
+            return
+
+        current_segment_pos = 0.0
+        if (
+            hasattr(self, "segment_player")
+            and self.segment_player.is_active
+            and self.segment_player.segment_is_playing
+        ):
+            current_segment_pos = self.current_pos - selected_segment.start_time
+        else:
+            if (
+                selected_segment.start_time
+                <= self.current_pos
+                <= selected_segment.end_time
+            ):
+                current_segment_pos = self.current_pos - selected_segment.start_time
+            else:
+                current_segment_pos = 0.0
+
+        # Calculate the absolute time in the entire MP3
+        absolute_time = selected_segment.start_time + current_segment_pos
+
+        # Calculate minutes, seconds, and milliseconds from the absolute time
+        total_seconds = int(absolute_time)
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        milliseconds = int((absolute_time - total_seconds) * 1000)
+
+        # Update the marker time input fields
+        self.marker_minute_entry.delete(0, tk.END)
+        self.marker_minute_entry.insert(0, str(minutes))
+
+        self.marker_second_entry.delete(0, tk.END)
+        self.marker_second_entry.insert(0, str(seconds))
+
+        self.marker_millisecond_entry.delete(0, tk.END)
+        self.marker_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+        # Update the preview marker time and redraw the display
+        self._preview_marker_time = absolute_time
+        self.redraw_progress_display()
+
+        # Update status to inform the user
+        self.status_label.config(
+            text=f"Marker time set to segment absolute time: {self.format_time(absolute_time)}"
+        )
+
+    def spacebar_play_pause(self, event: Optional[tk.Event] = None) -> None:
+        """Handle spacebar key press for play/pause functionality."""
+        logger.info("Spacebar pressed - triggering play/pause")
+        # Call the same method as the play button
+        self.play_pause()
+
+    def load_file(self) -> None:
+        logger.info("Loading file dialog opened")
+        filename = filedialog.askopenfilename(
+            title="Select Audio File",
+            filetypes=(
+                (
+                    "Audio files",
+                    "*.mp3 *.mp4 *.m4a *.wav *.flac *.aac *.ogg *.opus *.wma *.m4b *.m4p *.aiff *.aif *.aifc *.mka *.webm *.m3u *.m3u8",
+                ),
+            ),
+        )
+
+        if filename:
+            logger.info(f"Selected file: {filename}")
+
+            # If there's a currently playing file, stop it first
+            if (
+                self.playback_controller.process
+                and self.playback_controller.process.poll() is None
+            ):
+                # Send quit command to stop current mpv process
+                self.playback_controller.send_command({"command": ["quit"]})
+                self.playback_controller.process.terminate()
+                try:
+                    self.playback_controller.process.wait(
+                        timeout=2
+                    )  # Wait up to 2 seconds for process to terminate
+                except subprocess.TimeoutExpired:
+                    self.playback_controller.process.kill()  # Force kill if it doesn't terminate in time
+                self.playback_controller.process = None
+
+            # Reset state variables
+            self.current_file = filename
+            self.current_pos = 0.0
+            self.is_playing = False
+            self.play_button.config(text="Play")
+
+            # Reset markers
+            self.marker_manager.markers.clear()
+
+            # Update file label
+            self.file_label.config(text=os.path.basename(filename))
+
+            # Get duration using ffprobe (if available)
+            try:
+                result = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "quiet",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "csv=p=0",
+                        filename,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.duration = float(result.stdout.strip())
+                logger.info(f"File duration: {self.duration} seconds")
+            except Exception as e:
+                logger.warning(f"Could not get duration: {e}")
+                self.duration = 0  # Unknown duration
+
+            # Load any existing marker data for this file before adding fixed markers
+            self.load_marker_data()
+
+            # Automatically create marker0 at start and marker100 at end after loading data
+            # This must be done after duration is set
+            self.create_fixed_markers()
+
+            # Load and extract audio waveform
+            logger.info("Loading audio for waveform analysis...")
+            self.load_audio_waveform(filename)
+
+            # Load only the saved position (to avoid overwriting fixed markers)
+            self.load_saved_position_only()
+
+            # Start MPV process immediately to ensure it's ready when user wants to play
+            if (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            ):
+                logger.info("Starting mpv process with IPC immediately after file load")
+                self.playback_controller.start_playback()
+
+                # Wait briefly for process to start
+                time.sleep(0.5)
+
+                # If we have a saved position, seek to it after starting
+                if self.current_pos > 0:
+                    # Wait longer for the process to be ready
+                    time.sleep(0.5)
+                    response = self.playback_controller.send_command_with_retry(
+                        {"command": ["seek", self.current_pos, "absolute"]}
+                    )
+                    logger.info(
+                        f"Seeking to saved position after start: {self.format_time(self.current_pos)}, response: {response}"
+                    )
+
+            # Reset speed to 1x (only if mpv process is running)
+            if (
+                self.playback_controller.process
+                and self.playback_controller.process.poll() is not None
+            ):
+                self.playback_controller.send_command(
+                    {"command": ["set_property", "speed", 1.0]}
+                )
+            self.current_speed_label.config(text="1.0x")
+
+            # Enable buttons
+            self.play_button.config(state=tk.NORMAL)
+
+            # Update the time display to show initial state
+            self.update_time_display()
+
+            # Populate the "Jump to" time fields with the current playback time
+            total_seconds = int(self.current_pos)
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            milliseconds = int((self.current_pos - total_seconds) * 1000)
+
+            self.jump_minute_entry.delete(0, tk.END)
+            self.jump_minute_entry.insert(0, str(minutes))
+
+            self.jump_second_entry.delete(0, tk.END)
+            self.jump_second_entry.insert(0, str(seconds))
+
+            self.jump_millisecond_entry.delete(0, tk.END)
+            self.jump_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+            # Update marker UI components
+            self.marker_manager.update_marker_list()
+            self.segment_manager._calculate_segments()  # Recalculate segments after loading file
+            self.update_segment_list()  # Update segment list as well
+            self.redraw_progress_display()
+
+            self.status_label.config(text=f"Loaded: {os.path.basename(filename)}")
+            logger.info(f"Loaded file: {os.path.basename(filename)}")
+
+            # Schedule the first auto-save
+            self.schedule_next_auto_save()
+
+    def create_fixed_markers(self):
+        """Create fixed markers at the start and end of the file."""
+        if not self.current_file:
+            return
+
+        # Ensure marker0 and marker100 are properly set to fixed positions
+        # Remove any existing Marker0 or Marker100 to replace with correct positions
+        self.marker_manager.markers = [
+            m
+            for m in self.marker_manager.markers
+            if m["name"] != "Marker0" and m["name"] != "Marker100"
+        ]
+
+        # Add marker0 at start (always at 0.0)
+        marker0 = {"time": 0.0, "name": "Marker0"}
+        self.marker_manager.markers.append(marker0)
+
+        # Add marker100 at end (always at end of file)
+        # If duration is unknown, set it to a default value (e.g., 1 hour) to allow segment creation
+        if self.duration > 0:
+            marker100_time = self.duration - END_TOLERANCE
+        else:
+            # If duration is unknown, use a default value (e.g., 1 hour = 3600 seconds)
+            # This allows segments to be created even when duration is unknown
+            marker100_time = 3600.0
+            logger.warning(
+                f"Duration unknown for {self.current_file}, using default duration for marker100"
+            )
+
+        marker100 = {"time": marker100_time, "name": "Marker100"}
+        self.marker_manager.markers.append(marker100)
+
+        # Sort markers by time
+        self.marker_manager.markers.sort(key=lambda m: m["time"])
+
+        # Update UI
+        self.marker_manager.update_marker_list()
+        self.segment_manager._calculate_segments()  # Recalculate segments after creating fixed markers
+        self.update_segment_list()  # Update segment list as well
+        self.redraw_progress_display()
+
+    def load_audio_waveform(self, filename):
+        """Load and extract audio waveform for visualization using ffmpeg."""
+        try:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                filename,
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-vn",
+                "-f",
+                "wav",
+                "-",
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                self.audio_waveform = None
+                return
+
+            with wave.open(io.BytesIO(result.stdout.encode()), "rb") as wav_file:
+                sample_rate = wav_file.getframerate()
+                num_frames = wav_file.getnframes()
+                num_channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+
+                raw_data = wav_file.readframes(num_frames)
+
+                if sample_width == 2:
+                    samples = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32)
+                else:
+                    samples = np.frombuffer(raw_data, dtype=np.uint8).astype(np.float32)
+
+                samples = samples / 32767.0
+
+                max_val = np.max(np.abs(samples))
+                if max_val != 0:
+                    normalized_samples = np.abs(samples / max_val)
+                else:
+                    normalized_samples = np.zeros_like(samples, dtype=np.float32)
+
+                num_points = self.waveform_samples
+                if len(normalized_samples) > num_points:
+                    factor = len(normalized_samples) // num_points
+                    downsampled = (
+                        normalized_samples[: len(normalized_samples) // factor * factor]
+                        .reshape(-1, factor)
+                        .mean(axis=1)
+                    )
+                else:
+                    downsampled = normalized_samples
+
+            self.audio_waveform = downsampled
+            logger.info(f"Loaded waveform with {len(self.audio_waveform)} points")
+
+        except Exception as e:
+            logger.error(f"Could not load audio waveform: {e}")
+            self.audio_waveform = None
+
+    def play_pause(self) -> None:
+        logger.info(
+            f"Play/Pause button clicked. Current state: is_playing={self.is_playing}"
+        )
+
+        if not self.current_file:
+            logger.warning("No file loaded, cannot play")
+            return
+
+        if self.is_playing:
+            # Send pause command via IPC with retry logic
+            logger.info("Sending pause command to mpv")
+            response = self.playback_controller.send_command_with_retry(
+                {"command": ["set_property", "pause", True]}
+            )
+            logger.info(f"Pause command response: {response}")
+
+            self.is_playing = False
+            self.play_button.config(text="Play")
+
+            if self.timer_id:
+                self.root.after_cancel(self.timer_id)
+                self.timer_id = None
+
+            # Update progress display to reflect paused state
+            self.redraw_progress_display()
+
+            # Update segment play button state when pausing
+            if (
+                self.playback_controller.segment_enabled
+                and self.playback_controller.segment_start
+                < self.playback_controller.segment_end
+            ):
+                self.segment_play_button.config(text="Play Segment")
+
+            # Save the current position when pausing
+            self.auto_save_marker_data()
+
+            # Populate the "Jump to" time fields with the current playback time
+            total_seconds = int(self.current_pos)
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            milliseconds = int((self.current_pos - total_seconds) * 1000)
+
+            self.jump_minute_entry.delete(0, tk.END)
+            self.jump_minute_entry.insert(0, str(minutes))
+
+            self.jump_second_entry.delete(0, tk.END)
+            self.jump_second_entry.insert(0, str(seconds))
+
+            self.jump_millisecond_entry.delete(0, tk.END)
+            self.jump_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+            logger.info("Playback paused")
+        else:
+            # Check if we're at or near the end of the file, and if so, reset to beginning
+            if self.duration > 0 and self.current_pos >= self.duration - 0.01:
+                self.current_pos = (
+                    0.0  # Reset to beginning when trying to play from end
+                )
+                logger.info("Playback reached end, resetting to start")
+
+            # Since we now pause at the end instead of ending the process,
+            # we typically don't need to restart the process
+            should_restart = False  # Don't restart by default anymore
+
+            # Only restart if the process genuinely died or doesn't exist
+            if (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            ):
+                logger.info("MPV process not running, needs restart")
+                should_restart = True
+
+            if should_restart:
+                logger.info("Starting mpv process with IPC")
+                self.playback_controller.start_playback()
+
+                # Wait longer for the process to fully start and be ready
+                time.sleep(1.5)
+
+                # If we have a non-zero position (not starting from beginning), seek to that position after starting
+                if self.current_pos > 0:
+                    # Wait longer for the process to be ready
+                    time.sleep(0.5)
+                    response = self.playback_controller.send_command_with_retry(
+                        {"command": ["seek", self.current_pos, "absolute"]}
+                    )
+                    logger.info(
+                        f"Seeking to position after start: {self.format_time(self.current_pos)}, response: {response}"
+                    )
+
+            # For safety, ensure mpv is in paused state before unpausing
+            # Send play command via IPC with retry logic
+            logger.info("Sending play command to mpv")
+            response = self.playback_controller.send_command_with_retry(
+                {"command": ["set_property", "pause", False]}
+            )
+            logger.info(f"Play command response: {response}")
+
+            self.is_playing = True
+            self.play_button.config(text="Pause")
+
+            # Schedule the periodic position updates after a brief delay to ensure MPV processes play command
+            # This will run once immediately when called and then schedule future updates
+            def start_periodic_updates():
+                self.update_position_periodically()
+                # After starting periodic updates, ensure UI is current
+                self.update_time_display()
+
+            # If in segment playback mode, ensure we know we're playing a segment
+            # (This is handled in the update_position_periodically method)
+            if (
+                hasattr(self.playback_controller, "segment_enabled")
+                and self.playback_controller.segment_enabled
+            ):
+                if hasattr(self.playback_controller, "is_in_segment_playback"):
+                    self.playback_controller.is_in_segment_playback = True
+                # Update UI if we're playing a segment
+                if (
+                    hasattr(self.playback_controller, "segment_start")
+                    and hasattr(self.playback_controller, "segment_end")
+                    and self.playback_controller.segment_start
+                    < self.playback_controller.segment_end
+                ):
+                    loop_display = self.loop_count if self.loop_count != -1 else "∞"
+                    self.status_label.config(
+                        text=f"Playing segment: {self.format_time(self.playback_controller.segment_start)} - {self.format_time(self.playback_controller.segment_end)}, Loop {self.current_loop + 1}/{loop_display}"
+                    )
+                    if hasattr(self, "segment_play_button"):
+                        self.segment_play_button.config(text="Playing...")
+
+            # Give time for MPV to process the play command before starting position updates
+            self.root.after(50, start_periodic_updates)
+
+            # Schedule the next auto-save
+            self.schedule_next_auto_save()
+
+            logger.info("Playback started")
+
+    def fast_forward(self, seconds):
+        logger.info(f"Fast forward {seconds} seconds clicked")
+
+        if self.current_file:
+            # If the mpv process is not running or we're at the end of the file after completion, start it
+            # In some cases after playback finishes, MPV enters a state where it doesn't accept commands immediately
+            should_restart = (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            )
+
+            if should_restart:
+                logger.info(
+                    "MPV process not running or needs restart, starting it before seeking"
+                )
+                self.playback_controller.start_playback()
+                time.sleep(1.5)  # Wait for process to fully start and be ready
+
+                # If we just started the process, wait a bit more for it to fully load the file
+                # before attempting to seek to a position
+                time.sleep(0.5)
+
+            # Calculate new position
+            new_pos = min(self.current_pos + seconds, self.duration)
+
+            logger.info(f"Seeking to position: {self.format_time(new_pos)}")
+            # Send seek command via IPC with retry logic
+            response = self.playback_controller.send_command_with_retry(
+                {"command": ["seek", new_pos, "absolute"]}
+            )
+            logger.info(f"Seek command response: {response}")
+
+            self.current_pos = new_pos
+            logger.info(f"Current position updated to: {self.format_time(new_pos)}")
+
+            # Update the display to reflect the new position
+            self.update_time_display()
+
+            # Save the current position after fast forwarding
+            self.save_marker_data()
+            # Schedule the next auto-save
+            self.schedule_next_auto_save()
+
+    def rewind(self, seconds):
+        logger.info(f"Rewind {seconds} seconds clicked")
+
+        if self.current_file:
+            # If the mpv process is not running or we're at the end of the file after completion, start it
+            # In some cases after playback finishes, MPV enters a state where it doesn't accept commands immediately
+            should_restart = (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            )
+
+            if should_restart:
+                logger.info(
+                    "MPV process not running or needs restart, starting it before seeking"
+                )
+                self.playback_controller.start_playback()
+                time.sleep(1.5)  # Wait for process to fully start and be ready
+
+                # If we just started the process, wait a bit more for it to fully load the file
+                # before attempting to seek to a position
+                time.sleep(0.5)
+
+            # Calculate new position
+            new_pos = max(self.current_pos - seconds, 0)
+
+            logger.info(f"Seeking to position: {self.format_time(new_pos)}")
+            # Send seek command via IPC with retry logic
+            response = self.playback_controller.send_command_with_retry(
+                {"command": ["seek", new_pos, "absolute"]}
+            )
+            logger.info(f"Seek command response: {response}")
+
+            self.current_pos = new_pos
+            logger.info(f"Current position updated to: {self.format_time(new_pos)}")
+
+            # Update the display to reflect the new position
+            self.update_time_display()
+
+            # Save the current position after fast forwarding
+            self.save_marker_data()
+            # Schedule the next auto-save
+            self.schedule_next_auto_save()
+
+    def update_position_periodically(self) -> None:
+        """Update the position periodically while playing."""
+        if self.is_playing:
+            pos_response = self.playback_controller.send_command_with_retry(
+                {"command": ["get_property", "time-pos"]}
+            )
+            if (
+                pos_response
+                and "data" in pos_response
+                and pos_response["data"] is not None
+            ):
+                actual_pos = pos_response["data"]
+                self.current_pos = actual_pos
+
+                if (
+                    hasattr(self.playback_controller, "segment_enabled")
+                    and self.playback_controller.segment_enabled
+                ):
+                    if (
+                        hasattr(self.playback_controller, "segment_end")
+                        and actual_pos
+                        >= self.playback_controller.segment_end - TIME_JUMP_TOLERANCE
+                    ):
+                        if self.loop_count == -1 or self.current_loop < self.loop_count:
+                            self.current_loop += 1
+                            import time
+
+                            current_time = time.time()
+                            if (
+                                current_time - self.last_status_log_time
+                                >= self.status_log_interval
+                            ):
+                                logger.info(
+                                    f"Segment loop {self.current_loop} completed, looping back to start"
+                                )
+                                self.last_status_log_time = current_time
+                            if hasattr(self.playback_controller, "segment_start"):
+                                response = (
+                                    self.playback_controller.send_command_with_retry(
+                                        {
+                                            "command": [
+                                                "seek",
+                                                self.playback_controller.segment_start,
+                                                "absolute",
+                                            ]
+                                        }
+                                    )
+                                )
+                                current_time = time.time()
+                                if (
+                                    current_time - self.last_status_log_time
+                                    >= self.status_log_interval
+                                ):
+                                    logger.info(
+                                        f"Seek to segment start response: {response}"
+                                    )
+                                    self.last_status_log_time = current_time
+                                loop_display = (
+                                    self.loop_count if self.loop_count != -1 else "∞"
+                                )
+                                self.status_label.config(
+                                    text=f"Playing segment: {self.format_time(self.playback_controller.segment_start)} - {self.format_time(self.playback_controller.segment_end)}, Loop {self.current_loop}/{loop_display}"
+                                )
+                        else:
+                            logger.info("Segment playback completed, stopping")
+                            if hasattr(
+                                self.playback_controller, "is_in_segment_playback"
+                            ):
+                                self.playback_controller.is_in_segment_playback = False
+                            if hasattr(self, "segment_play_button"):
+                                self.segment_play_button.config(text="Play Segment")
+                            self.status_label.config(text="Segment playback completed")
+
+                self.update_time_display()
+
+                import time
+
+                current_time = time.time()
+                if current_time - self.last_status_log_time >= self.status_log_interval:
+                    self.last_status_log_time = current_time
+                    if (
+                        hasattr(self, "segment_player")
+                        and self.segment_player.is_active
+                        and self.segment_player.segment_is_playing
+                    ):
+                        if self.selected_segment_index is not None:
+                            segment = self.segment_manager.get_segment_by_index(
+                                self.selected_segment_index
+                            )
+                            if segment:
+                                self.status_label.config(
+                                    text=f"Segment {self.selected_segment_index + 1}: {self.format_time(segment.start_time)} - {self.format_time(segment.end_time)} (Playing)"
+                                )
+                    else:
+                        self.status_label.config(
+                            text=f"Playing: {self.format_time(self.current_pos)}"
+                        )
+
+                # Check if we've reached the end of the file with tolerance
+                if self.duration > 0 and actual_pos >= self.duration - END_TOLERANCE:
+                    logger.info("Playback reached end of file, pausing at end")
+                    # Instead of stopping playback, pause at the end position
+                    self.is_playing = False
+                    self.play_button.config(text="Play")
+                    self.current_pos = self.duration
+                    # Save the current position (which is the end) when reaching the end of file
+                    self.save_marker_data()
+                    # Pause the MPV process at the end position
+                    self.playback_controller.send_command_with_retry(
+                        {"command": ["set_property", "pause", True]}
+                    )
+                    logger.info("Paused MPV at end of file")
+                    # Also ensure the progress display is updated immediately
+                    self.update_time_display()
+                    self.redraw_progress_display()
+                    # Update the progress indicator to show paused state
+                    if self.timer_id:
+                        self.root.after_cancel(self.timer_id)
+                        self.timer_id = None
+                    # Schedule the next auto-save
+                    self.schedule_next_auto_save()
+                    return  # Exit the function to stop the timer loop
+            elif (
+                pos_response
+                and "error" in pos_response
+                and pos_response["error"] == "property unavailable"
+            ):
+                # Property might not be ready yet, just skip this update
+                logger.debug(
+                    "Time position property not available yet, skipping update"
+                )
+
+                # Check if this might be due to playback ending - if close to duration and playing, consider it ended
+                if (
+                    self.is_playing
+                    and self.duration > 0
+                    and self.current_pos >= self.duration - END_TOLERANCE
+                ):
+                    logger.info(
+                        "Playback appears to have reached end, property unavailable. Pausing at end."
+                    )
+                    # Reached end, pause playback
+                    self.is_playing = False
+                    self.play_button.config(text="Play")
+                    # Update display to reflect paused state
+                    self.update_time_display()
+                    self.redraw_progress_display()
+                    # Still schedule the next update to keep the timer running in case of intermittent issues
+                    # But we don't need to continue updating position
+                    if self.timer_id:
+                        self.root.after_cancel(self.timer_id)
+                        self.timer_id = None
+                    # Schedule the next auto-save
+                    self.schedule_next_auto_save()
+                    return  # Exit the function to stop the timer loop
+            else:
+                logger.debug(f"Could not get time position: {pos_response}")
+
+                # If we're getting consistent errors and we think we're near the end, treat as end of playback
+                if (
+                    self.is_playing
+                    and self.duration > 0
+                    and self.current_pos >= self.duration - END_TOLERANCE
+                ):
+                    logger.info(
+                        "Playback appears to have reached end with errors. Pausing at end."
+                    )
+                    # Reached end, pause playback
+                    self.is_playing = False
+                    self.play_button.config(text="Play")
+                    if self.timer_id:
+                        self.root.after_cancel(self.timer_id)
+                        self.timer_id = None
+                    # Update display to reflect paused state
+                    self.update_time_display()
+                    self.redraw_progress_display()
+                    # Schedule the next auto-save
+                    self.schedule_next_auto_save()
+                    return  # Exit the function to stop the timer loop
+
+            # Schedule next update
+            self.timer_id = self.root.after(
+                UPDATE_INTERVAL, self.update_position_periodically
+            )
+
+    def update_time_display(self) -> None:
+        """Update the time and progress bar display."""
+        if self.current_file:
+            time_str = f"{self.format_time(self.current_pos)} / {self.format_time(self.duration)}"
+            self.time_label.config(text=time_str)
+
+            if self.duration > 0:
+                # Update just the progress indicator position for better performance during playback
+                self.update_progress_indicator_only()
+
+        # Update the segment time display which now includes progress
+        self.update_segment_time_display()
+
+        # Update the segment absolute time display
+        self.update_segment_absolute_time_display()
+
+    def update_segment_absolute_time_display(self) -> None:
+        """Update the segment absolute time display showing the current segment time in the context of the entire MP3."""
+        if not hasattr(self, "segment_absolute_time_label"):
+            return
+
+        selection = self.segment_listbox.curselection()
+
+        # When playing multiple segments, use the currently playing segment's index
+        # instead of the first selected segment for accurate display
+        if (
+            hasattr(self, "segment_player")
+            and self.segment_player.is_active
+            and self.segment_player.segment_is_playing
+            and hasattr(self.segment_player, "selected_segments_to_play")
+            and len(self.segment_player.selected_segments_to_play) > 1
+            and self.segment_player.selected_segment_index is not None
+        ):
+            selected_idx = self.segment_player.selected_segment_index
+        elif selection:
+            selected_idx = selection[0]
+        else:
+            self.segment_absolute_time_label.config(
+                text="Segment absolute time: N/A (no segment selected)"
+            )
+            return
+
+        selected_segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if not selected_segment:
+            self.segment_absolute_time_label.config(
+                text="Segment absolute time: N/A (segment not found)"
+            )
+            return
+
+        if self.segment_player.is_active and self.segment_player.segment_is_playing:
+            absolute_time = (
+                selected_segment.start_time + self.segment_player.seg_current_pos
+            )
+        else:
+            absolute_time = self.current_pos
+
+        absolute_time_str = self.format_time(absolute_time)
+        self.segment_absolute_time_label.config(
+            text=f"Segment absolute time: {absolute_time_str}"
+        )
+
+    def update_progress_indicator_only(self) -> None:
+        """Update only the progress indicator position without redrawing the entire timeline."""
+        if not hasattr(self, "progress_canvas"):
+            return
+
+        # Get canvas dimensions
+        canvas_width, canvas_height = get_canvas_dimensions(self.progress_canvas)
+
+        # Calculate the indicator position
+        if self.duration > 0:
+            indicator_x = int((self.current_pos / self.duration) * canvas_width)
+            # Ensure the indicator is within the canvas bounds
+            indicator_x = max(0, min(canvas_width, indicator_x))
+
+            # Update the existing progress indicator line
+            try:
+                # Delete the existing progress indicator
+                self.progress_canvas.delete("progress_indicator")
+
+                # Create a new progress indicator at the correct position
+                if 0 <= indicator_x <= canvas_width:
+                    self.progress_canvas.create_line(
+                        indicator_x,
+                        0,
+                        indicator_x,
+                        canvas_height,
+                        width=3,
+                        fill=INDICATOR_COLOR,
+                        tag="progress_indicator",
+                    )
+            except tk.TclError:
+                # If there's an error (e.g., canvas doesn't exist yet), just redraw everything
+                self.redraw_progress_display()
+
+        # Update the segment time display which now includes progress
+        self.update_segment_time_display()
+
+    def format_time(self, seconds: float) -> str:
+        """Format time in seconds to MM:SS.sss format."""
+        if seconds <= 0:
+            return "00:00.000"
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        millisecs = int((seconds - int(seconds)) * 1000)
+        return TIME_FORMAT.format(mins, secs, millisecs)
+
+    def _populate_jump_entries(self, position: float) -> None:
+        """Populate the jump to time entry fields with the given position."""
+        total_seconds = int(position)
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        milliseconds = int((position - total_seconds) * 1000)
+
+        self.jump_minute_entry.delete(0, tk.END)
+        self.jump_minute_entry.insert(0, str(minutes))
+
+        self.jump_second_entry.delete(0, tk.END)
+        self.jump_second_entry.insert(0, str(seconds))
+
+        self.jump_millisecond_entry.delete(0, tk.END)
+        self.jump_millisecond_entry.insert(0, f"{milliseconds:03d}")
+
+    def on_closing(self, event: Optional[tk.Event] = None) -> None:
+        """Clean up when closing the application."""
+        logger.info("Application closing")
+
+        # Cancel any running timers first
+        if self.timer_id:
+            self.root.after_cancel(self.timer_id)
+            self.timer_id = None
+
+        # Send quit command to mpv to ensure clean exit
+        if self.playback_controller.ipc_socket_path:
+            logger.info("Sending quit command to mpv")
+            try:
+                response = self.playback_controller.send_command_with_retry(
+                    {"command": ["quit"]}
+                )
+                logger.info(f"Quit command response: {response}")
+                # Wait briefly to ensure mpv processes the quit command
+                time.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Error sending quit command: {e}")
+
+        if self.playback_controller.process:
+            logger.info(
+                f"Terminating mpv process with PID: {self.playback_controller.process.pid}"
+            )
+            try:
+                # First try graceful termination
+                self.playback_controller.process.terminate()
+                # Wait for up to 2 seconds for the process to terminate
+                self.playback_controller.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                logger.info("Process did not terminate gracefully, force killing...")
+                try:
+                    # Force kill the process
+                    self.playback_controller.process.kill()
+                    self.playback_controller.process.wait()
+                except Exception as e:
+                    logger.error(f"Error killing process: {e}")
+            except Exception as e:
+                logger.error(f"Error terminating process: {e}")
+
+        # Clean up socket file if it exists
+        if self.playback_controller.ipc_socket_path and os.path.exists(
+            self.playback_controller.ipc_socket_path
+        ):
+            try:
+                os.remove(self.playback_controller.ipc_socket_path)
+            except OSError as e:
+                logger.error(f"Could not remove socket file: {e}")
+            logger.info(
+                f"Removed IPC socket file: {self.playback_controller.ipc_socket_path}"
+            )
+
+        # Clean up auto-save timer
+        if self.auto_save_timer_id:
+            self.root.after_cancel(self.auto_save_timer_id)
+            self.auto_save_timer_id = None
+
+        self.root.destroy()
+        logger.info("Application closed")
+
+    def save_marker_data(self) -> None:
+        """Manually save marker data to a file."""
+        if not self.current_file:
+            logger.warning("No file loaded, cannot save")
+            self.status_label.config(text="No file loaded to save")
+            return
+
+        # Generate the marker data file name
+        base_path = os.path.splitext(self.current_file)[0]
+        marker_file = f"{base_path}_markers.json"
+
+        try:
+            # Prepare data to save - markers without content field
+            markers_data = []
+            for marker in self.marker_manager.markers:
+                markers_data.append(
+                    {
+                        "time": marker["time"],
+                        "name": marker["name"],
+                        "comment": marker.get("comment", ""),
+                    }
+                )
+
+            # Save segments with their transcription content
+            segments_data = []
+            for seg in self.segment_manager.segments:
+                content_preview = seg.content[:50] if seg.content else ""
+                logger.info(
+                    f"Saving segment {seg.index}: content='{content_preview}...'"
+                )
+                segments_data.append(
+                    {
+                        "index": seg.index + 1,  # Convert to 1-based
+                        "content": seg.content if seg.content else "",
+                    }
+                )
+
+            save_data = {
+                "markers": markers_data,
+                "segments": segments_data,
+                "current_position": self.current_pos,
+            }
+
+            # Write to file
+            with open(marker_file, "w", encoding="utf-8") as f:
+                json.dump(save_data, f, indent=2)
+
+            logger.info(f"Manually saved marker data to {marker_file}")
+            self.status_label.config(text=f"Saved: {os.path.basename(marker_file)}")
+
+        except Exception as e:
+            logger.error(f"Error saving marker data: {e}")
+            self.status_label.config(text=f"Save error: {str(e)}")
+
+    def load_marker_data(self) -> None:
+        """Load marker data from a file if it exists."""
+        if not self.current_file:
+            return
+
+        # Generate the marker data file name
+        base_path = os.path.splitext(self.current_file)[0]
+        marker_file = f"{base_path}_markers.json"
+
+        if os.path.exists(marker_file):
+            try:
+                with open(marker_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                # Load markers - clear existing markers first to avoid duplicates
+                loaded_markers = data.get("markers", [])
+
+                # Clear existing markers and use loaded markers
+                self.marker_manager.markers = []
+                for marker in loaded_markers:
+                    self.marker_manager.markers.append(marker.copy())
+
+                # Load and set the saved current position if it exists
+                saved_position = data.get("current_position", 0.0)
+                if saved_position > 0:
+                    self.current_pos = saved_position
+                    logger.info(f"Loaded saved position: {saved_position}")
+
+                # Update UI
+                self.marker_manager.update_marker_list()
+                self.segment_manager._calculate_segments()
+                self.update_segment_list()
+
+                # Load segment transcription content
+                loaded_segments = data.get("segments", [])
+                has_restored_content = False
+                for seg_data in loaded_segments:
+                    content = seg_data.get("content", "")
+                    if content:
+                        has_restored_content = True
+                    seg_index = seg_data.get("index", 0) - 1
+                    if seg_index >= 0 and seg_index < len(
+                        self.segment_manager.segments
+                    ):
+                        self.segment_manager.segments[seg_index].content = content
+                        logger.info(
+                            f"Loaded content for segment {seg_index}: '{content[:50]}...'"
+                        )
+                    else:
+                        logger.warning(
+                            f"Could not load content for segment index {seg_index}"
+                        )
+
+                logger.info(f"has_restored_content = {has_restored_content}")
+
+                # Show the button if there's restored content
+                if has_restored_content and hasattr(self, "show_content_button"):
+                    self.show_content_button.pack(fill=tk.X, padx=5, pady=(0, 2))
+                    self.status_label.config(
+                        text="Restored content available. Click 'Show Content' to view."
+                    )
+
+                # Auto-select first segment if none selected and segments exist
+                selection = self.segment_listbox.curselection()
+                if not selection and self.segment_manager.get_segment_count() > 0:
+                    self.segment_listbox.selection_set(0)
+                    self.on_segment_select(None)
+
+                self.redraw_progress_display()
+
+                logger.info(f"Loaded marker data from {marker_file}")
+                self.status_label.config(
+                    text=f"Loaded markers: {os.path.basename(marker_file)}"
+                )
+
+            except Exception as e:
+                logger.error(f"Error loading marker data: {e}")
+                self.status_label.config(text=f"Load error: {str(e)}")
+
+    def load_saved_position_only(self) -> None:
+        """Load only the saved position from marker data file if it exists."""
+        if not self.current_file:
+            return
+
+        # Generate the marker data file name
+        base_path = os.path.splitext(self.current_file)[0]
+        marker_file = f"{base_path}_markers.json"
+
+        if os.path.exists(marker_file):
+            try:
+                with open(marker_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                # Load and set the saved current position if it exists
+                saved_position = data.get("current_position", 0.0)
+                if saved_position > 0:
+                    self.current_pos = saved_position
+                    logger.info(f"Loaded saved position: {saved_position}")
+
+            except Exception as e:
+                logger.error(f"Error loading saved position: {e}")
+
+    def auto_save_marker_data(self) -> None:
+        """Auto-save marker data to a file, preserving existing segments data."""
+        if not self.current_file:
+            logger.debug("No file loaded, skipping auto-save")
+            return
+
+        # Generate the marker data file name
+        base_path = os.path.splitext(self.current_file)[0]
+        marker_file = f"{base_path}_markers.json"
+
+        try:
+            # Load existing segment data to preserve transcriptions (don't auto-overwrite)
+            existing_segments = {}
+            if os.path.exists(marker_file):
+                try:
+                    with open(marker_file, "r", encoding="utf-8") as f:
+                        existing_data = json.load(f)
+                        for seg in existing_data.get("segments", []):
+                            existing_segments[seg.get("index")] = seg.get("content", "")
+                except json.JSONDecodeError:
+                    logger.warning(f"Could not parse existing marker file")
+
+            # Update existing segments with current content (preserve existing transcriptions)
+            segments_data = []
+            for seg in self.segment_manager.segments:
+                seg_idx = seg.index + 1
+                # Use existing content if available, otherwise use current content
+                content = existing_segments.get(
+                    seg_idx, seg.content if seg.content else ""
+                )
+                segments_data.append(
+                    {
+                        "index": seg_idx,
+                        "content": content,
+                    }
+                )
+
+            # Prepare data to save
+            save_data = {
+                "markers": self.marker_manager.markers,
+                "segments": segments_data,
+                "current_position": self.current_pos,
+            }
+
+            # Write to file
+            with open(marker_file, "w", encoding="utf-8") as f:
+                json.dump(save_data, f, indent=2)
+
+            logger.info(f"Auto-saved marker data to {marker_file}")
+
+        except Exception as e:
+            logger.error(f"Error auto-saving marker data: {e}")
+
+    def schedule_next_auto_save(self) -> None:
+        """Auto-save disabled."""
+        pass
+
+    def on_marker_time_change(self, event=None) -> None:
+        """Handle changes to the marker time input fields and show a preview line on the timeline."""
+        try:
+            # Parse time from input fields
+            minute_str = self.marker_minute_entry.get().strip()
+            second_str = self.marker_second_entry.get().strip()
+            millisecond_str = self.marker_millisecond_entry.get().strip()
+
+            minutes = int(minute_str) if minute_str else 0
+            seconds = int(second_str) if second_str else 0
+            milliseconds = int(millisecond_str) if millisecond_str else 0
+
+            # Calculate total time in seconds
+            total_seconds = minutes * 60 + seconds + milliseconds / 1000.0
+
+            # Store the preview time for drawing
+            self._preview_marker_time = total_seconds
+
+            # Redraw the progress display to show the preview line
+            self.redraw_progress_display()
+        except ValueError:
+            # If there's an error parsing the values, clear the preview
+            if hasattr(self, "_preview_marker_time"):
+                delattr(self, "_preview_marker_time")
+            self.redraw_progress_display()
+
+    def start_continuous_adjustment(self, time_delta: float) -> None:
+        """Start continuous adjustment of the marker time."""
+        self.continuous_time_delta = time_delta
+        self.is_adjusting = True
+        self._perform_continuous_adjustment()
+
+    def stop_continuous_adjustment(self) -> None:
+        """Stop continuous adjustment of the marker time."""
+        self.is_adjusting = False
+        if hasattr(self, "adjustment_timer_id"):
+            self.root.after_cancel(self.adjustment_timer_id)
+            delattr(self, "adjustment_timer_id")
+
+    def _perform_continuous_adjustment(self) -> None:
+        """Perform the actual continuous adjustment."""
+        if hasattr(self, "is_adjusting") and self.is_adjusting:
+            # Call the adjust_marker_time method with the time delta
+            self.marker_manager.adjust_marker_time(self.continuous_time_delta)
+
+            # Schedule the next adjustment after a short delay
+            self.adjustment_timer_id = self.root.after(
+                100, self._perform_continuous_adjustment
+            )
+
+    def adjust_marker_time(self, time_delta: float) -> None:
+        """Adjust the marker time by the specified delta."""
+        self.marker_manager.adjust_marker_time(time_delta)
+
+    def validate_preview_duration(self, event: Optional[tk.Event] = None) -> None:
+        """Validate that preview duration is an integer between 1 and 20."""
+        if event is None:  # If no event, exit early
+            return
+
+        # Get the current text from the entry widget
+        widget = self.preview_duration_entry
+        current_text = widget.get()
+        logger.info(f"Preview duration validation triggered: '{current_text}'")
+
+        # Filter out non-numeric characters
+        new_text = "".join(char for char in current_text if char.isdigit())
+
+        # Apply limits: only allow integers between 1 and 20
+        if new_text:
+            try:
+                value = int(new_text)
+                if value < 1:
+                    new_text = "1"
+                elif value > 20:
+                    new_text = "20"
+            except ValueError:
+                # If conversion fails, keep the original text
+                pass
+
+        # If text is different, update the entry
+        if current_text != new_text:
+            logger.info(
+                f"Preview duration corrected from '{current_text}' to '{new_text}'"
+            )
+            widget.delete(0, tk.END)
+            widget.insert(0, new_text)
+
+    def preview_marker_time(self) -> None:
+        """Preview the marker time by playing specified seconds from the specified time."""
+        if not self.current_file:
+            logger.warning("No file loaded, cannot preview")
+            self.status_label.config(text="No file loaded")
+            return
+
+        try:
+            minute_str = self.marker_minute_entry.get().strip()
+            second_str = self.marker_second_entry.get().strip()
+            millisecond_str = self.marker_millisecond_entry.get().strip()
+
+            minutes = int(minute_str) if minute_str else 0
+            seconds = int(second_str) if second_str else 0
+            milliseconds = int(millisecond_str) if millisecond_str else 0
+
+            preview_time = minutes * 60 + seconds + milliseconds / 1000.0
+
+            duration_str = self.preview_duration_entry.get().strip()
+            if not duration_str or not duration_str.isdigit():
+                preview_duration = 8
+            else:
+                preview_duration = int(duration_str)
+                preview_duration = max(1, min(20, preview_duration))
+
+            original_position = self.current_pos
+
+            should_restart = (
+                not self.playback_controller.process
+                or self.playback_controller.process.poll() is not None
+            )
+
+            if should_restart:
+                logger.info("MPV process not running, starting it before preview")
+                self.playback_controller.start_playback()
+                time.sleep(1.5)
+
+            logger.info(f"Seeking to preview time: {self.format_time(preview_time)}")
+            response = self.playback_controller.send_command(
+                {"command": ["seek", preview_time, "absolute"]}
+            )
+            logger.info(f"Preview seek response: {response}")
+
+            self.playback_controller.send_command(
+                {"command": ["set_property", "pause", False]}
+            )
+
+            def stop_preview_and_return():
+                self.playback_controller.send_command(
+                    {"command": ["set_property", "pause", True]}
+                )
+                logger.info(
+                    f"Returning to original position: {self.format_time(original_position)}"
+                )
+                response = self.playback_controller.send_command(
+                    {"command": ["seek", original_position, "absolute"]}
+                )
+                logger.info(f"Return to original position response: {response}")
+
+            self.root.after(preview_duration * 1000, stop_preview_and_return)
+
+            self.status_label.config(
+                text=f"Previewing from {self.format_time(preview_time)} for {preview_duration} seconds..."
+            )
+
+        except ValueError:
+            logger.error("Invalid time format entered for preview")
+            self.status_label.config(text="Invalid time format. Enter numbers only.")
+        except Exception as e:
+            logger.error(f"Error during preview: {e}")
+            self.status_label.config(text=f"Error during preview: {e}")
+
+    def update_segment_time_display(self) -> None:
+        """Update the segment-specific timeline that shows current time within the selected segment.
+
+        This is an independent timeline from the main progress bar.
+        """
+        if not hasattr(self, "segment_time_canvas"):
+            return
+
+        self.segment_time_canvas.delete("all")
+
+        canvas_width = self.segment_time_canvas.winfo_width()
+        if canvas_width <= 1:
+            canvas_width = 400
+        canvas_height = 30
+
+        selection = self.segment_listbox.curselection()
+
+        # When segment is playing, use the currently playing segment's index
+        # Don't change display when user clicks on different segments
+        if (
+            hasattr(self, "segment_player")
+            and self.segment_player.is_active
+            and self.segment_player.segment_is_playing
+            and self.segment_player.selected_segment_index is not None
+        ):
+            selected_idx = self.segment_player.selected_segment_index
+        elif selection:
+            selected_idx = selection[0]
+        else:
+            # No segment selected
+            self.segment_time_canvas.create_text(
+                canvas_width // 2,
+                canvas_height // 2,
+                text="Select a segment to view its timeline",
+                fill="#666666",
+                anchor="center",
+            )
+            return
+        selected_segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if not selected_segment:
+            self.segment_time_canvas.create_text(
+                canvas_width // 2,
+                canvas_height // 2,
+                text="Segment not found",
+                fill="#666666",
+                anchor="center",
+            )
+            return
+
+        self.segment_time_canvas.create_rectangle(
+            0, 0, canvas_width, canvas_height, fill="#f0f0f0", outline="#cccccc"
+        )
+
+        for i in range(5):
+            percent = i * 25
+            x_pos = (percent / 100) * canvas_width
+            self.segment_time_canvas.create_line(
+                x_pos, 0, x_pos, canvas_height, fill="#cccccc", width=1
+            )
+
+            relative_time_at_marker = (percent / 100) * selected_segment.duration
+            total_seconds = int(relative_time_at_marker)
+            milliseconds = int((relative_time_at_marker - total_seconds) * 1000)
+            time_text = f"{total_seconds}.{milliseconds:03d}"
+
+            if percent == 100:
+                self.segment_time_canvas.create_text(
+                    x_pos,
+                    5,
+                    text=time_text,
+                    anchor="ne",
+                    fill="#333333",
+                    font=("TkDefaultFont", 8),
+                )
+            else:
+                self.segment_time_canvas.create_text(
+                    x_pos,
+                    5,
+                    text=time_text,
+                    anchor="n",
+                    fill="#333333",
+                    font=("TkDefaultFont", 8),
+                )
+
+        if selected_segment.duration > 0:
+            current_segment_time = 0.0
+            segment_progress = 0.0
+
+            if self.segment_player.is_active:
+                current_segment_time = self.segment_player.seg_current_pos
+                segment_progress = current_segment_time / selected_segment.duration
+            else:
+                current_segment_time = 0.0
+                segment_progress = 0.0
+
+            segment_progress = max(0, min(1, segment_progress))
+
+            progress_width = segment_progress * canvas_width
+
+            if progress_width > 0:
+                self.segment_time_canvas.create_rectangle(
+                    0, 0, progress_width, canvas_height, fill="#e0e0e0", outline=""
+                )
+
+            indicator_x = int(segment_progress * canvas_width)
+
+            if 0 <= indicator_x <= canvas_width:
+                self.segment_time_canvas.create_line(
+                    indicator_x,
+                    0,
+                    indicator_x,
+                    canvas_height,
+                    width=2,
+                    fill="#ff3b30",
+                    tag="segment_time_indicator",
+                )
+
+            total_seconds_current = int(current_segment_time)
+            milliseconds_current = int(
+                (current_segment_time - total_seconds_current) * 1000
+            )
+            current_time_text = f"{total_seconds_current}.{milliseconds_current:03d}"
+
+            total_seconds_duration = int(selected_segment.duration)
+            milliseconds_duration = int(
+                (selected_segment.duration - total_seconds_duration) * 1000
+            )
+            duration_text = f"{total_seconds_duration}.{milliseconds_duration:03d}"
+
+            time_text = f"{current_time_text} / {duration_text}"
+            self.segment_time_canvas.create_text(
+                indicator_x,
+                canvas_height - 5,
+                text=time_text,
+                anchor="s",
+                fill="#000000",
+                font=("TkDefaultFont", 8),
+            )
+
+    def transcribe_segment(self) -> None:
+        """Transcribe the currently selected segment using Whisper."""
+        if not self.current_file:
+            self.status_label.config(text="No audio file loaded")
+            return
+
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.status_label.config(text="Please select a segment first")
+            return
+
+        selected_idx = selection[0]
+        segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if not segment:
+            self.status_label.config(text="Segment not found")
+            return
+
+        segment_name = f"Segment {selected_idx + 1}: {self.format_time(segment.start_time)} - {self.format_time(segment.end_time)}"
+        self.transcription_segment_label.set(segment_name)
+
+        self.status_label.config(text="Extracting audio segment...")
+        self.transcription_status.set("Extracting audio...")
+        logger.info(
+            f"Starting transcription for segment {selected_idx + 1}: {self.format_time(segment.start_time)} - {self.format_time(segment.end_time)}"
+        )
+
+        from .audio_utils import (
+            extract_audio_segment,
+            cleanup_temp_audio,
+            validate_segment_times,
+        )
+
+        is_valid, error_msg = validate_segment_times(
+            segment.start_time, segment.end_time
+        )
+        if not is_valid:
+            self.status_label.config(text=error_msg)
+            self.transcription_status.set(error_msg)
+            return
+
+        logger.info(f"Extracting audio from {self.current_file}")
+        temp_audio = extract_audio_segment(
+            self.current_file, segment.start_time, segment.end_time
+        )
+        if not temp_audio:
+            logger.error("Failed to extract audio segment")
+            self.status_label.config(text="Failed to extract audio segment")
+            self.transcription_status.set("Extraction failed")
+            return
+
+        logger.info(f"Audio extracted to: {temp_audio}")
+        self.status_label.config(text="Transcribing with WhisperX...")
+        self.transcription_status.set("Transcribing...")
+        self.transcribe_button.config(state="disabled")
+
+        from .whisper_transcriber import WhisperTranscriber
+
+        def on_transcription_complete(text: Optional[str]) -> None:
+            self.transcribe_button.config(state="normal")
+            cleanup_temp_audio(temp_audio)
+
+            if text:
+                logger.info(f"Transcription successful: {len(text)} characters")
+                segment.content = text
+                self.transcription_text.delete(1.0, tk.END)
+                self.transcription_text.insert(tk.END, text)
+                self.transcription_text.edit_reset()  # Clear modified flag
+                self.transcription_status.set(f"({len(text)} chars)")
+                self.status_label.config(text="Transcription complete")
+                self.save_marker_data()
+            else:
+                logger.error("Transcription returned empty result")
+                self.transcription_status.set("Transcription failed")
+                self.status_label.config(text="Transcription failed")
+
+        def on_progress(message: str) -> None:
+            logger.info(f"Transcription progress: {message}")
+            self.transcription_status.set(message)
+            self.root.update_idletasks()
+
+        def on_error(message: str) -> None:
+            logger.error(f"Transcription error: {message}")
+
+        transcriber = WhisperTranscriber(
+            model_size="medium",
+            model_path=getattr(self, "model_path_var", tk.StringVar()).get(),
+            device=None,
+        )
+        logger.info("Starting async transcription...")
+        transcriber.transcribe_async(
+            audio_path=temp_audio,
+            on_complete=on_transcription_complete,
+            on_error=on_error,
+            progress_callback=on_progress,
+        )
+
+    def load_transcription_for_segment(self) -> None:
+        """Load existing transcription for the currently selected segment."""
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.transcription_text.delete(1.0, tk.END)
+            return
+
+        selected_idx = selection[0]
+        segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if segment:
+            self.transcription_text.delete(1.0, tk.END)
+            if segment.content:
+                self._restored_content = segment.content
+                self.transcription_status.set(
+                    f"({len(segment.content)} chars, click 'Show Content' to view)"
+                )
+                self.show_content_button.config(text="Show Content")
+                self.show_content_button.config(command=self.show_restored_content)
+            else:
+                self.transcription_status.set("(No content)")
+                self.show_content_button.config(text="Show Content")
+                self.show_content_button.config(command=self.show_restored_content)
+        else:
+            self.transcription_text.delete(1.0, tk.END)
+
+    def show_restored_content(self) -> None:
+        """Show the restored content from JSON file."""
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.status_label.config(text="Please select a segment first")
+            return
+
+        selected_idx = selection[0]
+        segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if segment and segment.content:
+            self.transcription_text.delete(1.0, tk.END)
+            self.transcription_text.insert(tk.END, segment.content)
+            self.transcription_status.set(f"({len(segment.content)} chars)")
+            self.show_content_button.config(text="Hide Content")
+            self.show_content_button.config(command=self.hide_restored_content)
+        elif segment:
+            self.status_label.config(text="No content available for this segment")
+        else:
+            self.status_label.config(text="Segment not found")
+
+    def hide_restored_content(self) -> None:
+        """Hide the restored content."""
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.status_label.config(text="Please select a segment first")
+            return
+
+        selected_idx = selection[0]
+        segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if segment:
+            self.transcription_text.delete(1.0, tk.END)
+            if segment.content:
+                self.transcription_status.set(
+                    f"({len(segment.content)} chars, click 'Show Content' to view)"
+                )
+            else:
+                self.transcription_status.set("(No content)")
+            self.show_content_button.config(text="Show Content")
+            self.show_content_button.config(command=self.show_restored_content)
+        else:
+            self.status_label.config(text="Segment not found")
+
+    def show_restored_content(self) -> None:
+        """Show the restored content from JSON file."""
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.status_label.config(text="Please select a segment first")
+            return
+
+        selected_idx = selection[0]
+        segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if segment and segment.content:
+            self.transcription_text.delete(1.0, tk.END)
+            self.transcription_text.insert(tk.END, segment.content)
+            self.transcription_status.set(f"({len(segment.content)} chars)")
+            self.show_content_button.config(text="Hide Content")
+            self.show_content_button.config(command=self.hide_restored_content)
+        elif segment:
+            self.status_label.config(text="No content available for this segment")
+        else:
+            self.status_label.config(text="Segment not found")
+
+    def hide_restored_content(self) -> None:
+        """Hide the restored content."""
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.status_label.config(text="Please select a segment first")
+            return
+
+        selected_idx = selection[0]
+        segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if segment:
+            self.transcription_text.delete(1.0, tk.END)
+            if segment.content:
+                self.transcription_status.set(f"({len(segment.content)} chars)")
+            else:
+                self.transcription_status.set("")
+            self.show_content_button.config(text="Show Content")
+            self.show_content_button.config(command=self.show_restored_content)
+        else:
+            self.status_label.config(text="Segment not found")
+
+    def save_transcription(self) -> None:
+        """Save the current transcription text to the selected segment."""
+        selection = self.segment_listbox.curselection()
+        if not selection:
+            self.status_label.config(text="No segment selected")
+            return
+
+        selected_idx = selection[0]
+        segment = self.segment_manager.get_segment_by_index(selected_idx)
+        if segment:
+            text_content = self.transcription_text.get(1.0, tk.END).strip()
+            if text_content:
+                content = text_content
+            else:
+                content = (
+                    getattr(self, "_restored_content", "") or segment.content or ""
+                )
+            segment.content = content
+            self.transcription_status.set(f"Saved ({len(content)} chars)")
+            self.save_marker_data()
+            self.status_label.config(text="Transcription saved")
+        else:
+            self.status_label.config(text="Segment not found")
+
+    def run(self) -> None:
+        """Run the GUI application."""
+        self.root.mainloop()

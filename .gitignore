@@ -1,0 +1,8 @@
+.opencode/
+logs/
+files/
+venv/
+openspec/
+AGENTS.md
+New Empty File
+*.zip

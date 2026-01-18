@@ -1,0 +1,568 @@
+"""
+Module for handling segment-specific playback functionality.
+
+This module provides simplified functionality to play, navigate audio segments
+with dedicated controls for single or multi-segment selection.
+"""
+
+import logging
+import time
+import tkinter as tk
+from typing import Optional, List
+
+logger = logging.getLogger(__name__)
+
+
+class SegmentPlayer:
+    """
+    Manages segment-specific playback with simplified controls.
+
+    Features:
+    - Activate/deactivate segment player mode
+    - Single/multi-segment selection via Ctrl/Shift
+    - Sequential multi-segment playback
+    - Play/Pause with position memory
+    - Prev/Next segment navigation
+    """
+
+    def __init__(self, player_instance, segment_manager):
+        """
+        Initialize the SegmentPlayer.
+
+        Args:
+            player_instance: Reference to the main MP3Player instance
+            segment_manager: Reference to the SegmentManager instance
+        """
+        self.player = player_instance
+        self.segment_manager = segment_manager
+
+        self.is_active: bool = False
+        self.selected_segment_index: Optional[int] = None
+        self.seg_current_pos: float = 0.0
+        self.segment_is_playing: bool = False
+        self.segment_paused_position: Optional[float] = None
+        self.segment_paused_selection: Optional[List[int]] = None
+        self.segment_playback_timer: Optional[str] = None
+
+        self.current_segment_index: int = 0
+        self.selected_segments_to_play: List = []
+
+        self.repeat_interval: int = 5
+        self.repeat_times: int = 3
+        self.current_repeat_count: int = 0
+        self.remaining_repeats: int = 0
+        self.repeat_timer: Optional[str] = None
+
+    def set_repeat_interval(self, interval: int) -> None:
+        """Set the repeat interval in seconds."""
+        self.repeat_interval = max(1, min(120, interval))
+        logger.info(f"Repeat interval set to {self.repeat_interval} seconds")
+
+    def set_repeat_times(self, times: int) -> None:
+        """Set the number of repeat times."""
+        self.repeat_times = max(1, min(100, times))
+        logger.info(f"Repeat times set to {self.repeat_times}")
+
+    def apply_repeat_settings(self) -> None:
+        """Apply repeat settings from UI entries."""
+        try:
+            ri = int(self.player.ri_entry.get())
+            rt = int(self.player.rt_entry.get())
+            self.set_repeat_interval(ri)
+            self.set_repeat_times(rt)
+            # Update remaining repeats if playback is active
+            if self.segment_is_playing or self.segment_paused_position is not None:
+                self.remaining_repeats = self.repeat_times
+            self.player.status_label.config(
+                text=f"Repeat: {self.repeat_interval}s x {self.repeat_times}"
+            )
+        except ValueError:
+            self.player.status_label.config(text="Invalid repeat settings")
+
+    def activate(self) -> None:
+        """Enable segment player mode."""
+        self.is_active = True
+        self._enable_segment_controls()
+        self.player.status_label.config(text="Segment player mode activated")
+
+    def deactivate(self) -> None:
+        """Disable segment player mode."""
+        self.is_active = False
+        if self.segment_is_playing:
+            self.player.playback_controller.send_command(
+                {"command": ["set_property", "pause", True]}
+            )
+        self.segment_is_playing = False
+        self.segment_paused_position = None
+        self.segment_paused_selection = None
+        if self.segment_playback_timer:
+            self.player.root.after_cancel(self.segment_playback_timer)
+            self.segment_playback_timer = None
+        self._disable_segment_controls()
+        self.player.status_label.config(text="Segment player mode deactivated")
+
+    def _disable_segment_controls(self) -> None:
+        """Disable segment-related UI controls."""
+        if hasattr(self.player, "segment_play_pause_button"):
+            self.player.segment_play_pause_button.config(state="disabled")
+        if hasattr(self.player, "back_5s_button"):
+            self.player.back_5s_button.config(state="disabled")
+        if hasattr(self.player, "back_2s_button"):
+            self.player.back_2s_button.config(state="disabled")
+        if hasattr(self.player, "back_1s_button"):
+            self.player.back_1s_button.config(state="disabled")
+        if hasattr(self.player, "back_05s_button"):
+            self.player.back_05s_button.config(state="disabled")
+        if hasattr(self.player, "fwd_05s_button"):
+            self.player.fwd_05s_button.config(state="disabled")
+        if hasattr(self.player, "fwd_1s_button"):
+            self.player.fwd_1s_button.config(state="disabled")
+        if hasattr(self.player, "fwd_2s_button"):
+            self.player.fwd_2s_button.config(state="disabled")
+        if hasattr(self.player, "fwd_5s_button"):
+            self.player.fwd_5s_button.config(state="disabled")
+        if hasattr(self.player, "prev_seg_button"):
+            self.player.prev_seg_button.config(state="disabled")
+        if hasattr(self.player, "next_seg_button"):
+            self.player.next_seg_button.config(state="disabled")
+
+    def _enable_segment_controls(self) -> None:
+        """Enable segment-related UI controls."""
+        if hasattr(self.player, "segment_play_pause_button"):
+            self.player.segment_play_pause_button.config(state="normal")
+        if hasattr(self.player, "back_5s_button"):
+            self.player.back_5s_button.config(state="normal")
+        if hasattr(self.player, "back_2s_button"):
+            self.player.back_2s_button.config(state="normal")
+        if hasattr(self.player, "back_1s_button"):
+            self.player.back_1s_button.config(state="normal")
+        if hasattr(self.player, "back_05s_button"):
+            self.player.back_05s_button.config(state="normal")
+        if hasattr(self.player, "fwd_05s_button"):
+            self.player.fwd_05s_button.config(state="normal")
+        if hasattr(self.player, "fwd_1s_button"):
+            self.player.fwd_1s_button.config(state="normal")
+        if hasattr(self.player, "fwd_2s_button"):
+            self.player.fwd_2s_button.config(state="normal")
+        if hasattr(self.player, "fwd_5s_button"):
+            self.player.fwd_5s_button.config(state="normal")
+        if hasattr(self.player, "prev_seg_button"):
+            self.player.prev_seg_button.config(state="normal")
+        if hasattr(self.player, "next_seg_button"):
+            self.player.next_seg_button.config(state="normal")
+
+    def play_segment(self) -> None:
+        """Start playback of the selected segment(s)."""
+        if not self.is_active:
+            logger.warning("Cannot play segment: segment player mode not active")
+            self.player.status_label.config(text="Segment player mode not active")
+            return
+
+        selected_indices = self.player.segment_listbox.curselection()
+        if not selected_indices:
+            logger.warning("No segment selected for playback")
+            self.player.status_label.config(text="Please select a segment first")
+            return
+
+        sorted_indices = sorted(selected_indices)
+        self.selected_segments_to_play = []
+        for idx in sorted_indices:
+            segment = self.segment_manager.get_segment_by_index(idx)
+            if segment:
+                self.selected_segments_to_play.append(segment)
+
+        if not self.selected_segments_to_play:
+            logger.warning("No valid segments found in selection")
+            self.player.status_label.config(text="No valid segments found")
+            return
+
+        current_indices = list(sorted_indices)
+        if self.segment_paused_position is not None:
+            start_time = self.segment_paused_position
+            # Update seg_current_pos based on paused position
+            first_segment = self.selected_segments_to_play[0]
+            self.seg_current_pos = start_time - first_segment.start_time
+            logger.info(
+                f"Resuming playback from paused position: {self.player.format_time(start_time)}"
+            )
+        else:
+            first_segment = self.selected_segments_to_play[0]
+            start_time = first_segment.start_time
+            self.seg_current_pos = 0.0
+            logger.info(
+                f"Starting playback from beginning of segment {first_segment.index + 1}: {self.player.format_time(start_time)}"
+            )
+
+        self._original_selection = current_indices
+
+        self.segment_paused_selection = None
+        self.segment_paused_position = None
+        self.current_segment_index = 0
+
+        # Initialize remaining repeats
+        self.remaining_repeats = self.repeat_times
+
+        first_segment = self.selected_segments_to_play[0]
+        self.selected_segment_index = first_segment.index
+        self._last_playing_segment_index = first_segment.index
+        self.player._update_segment_timeline_label(first_segment.index)
+
+        self._ensure_mpv_running()
+        self._seek_to(start_time)
+        self._start_playback()
+        self.player.update_time_display()
+
+    def pause_segment(self) -> None:
+        """Pause playback of the current segment(s)."""
+        if not self.segment_is_playing:
+            return
+
+        self.player.playback_controller.send_command(
+            {"command": ["set_property", "pause", True]}
+        )
+        self.segment_is_playing = False
+
+        pos_response = self.player.playback_controller.send_command(
+            {"command": ["get_property", "time-pos"]}
+        )
+        if pos_response and "data" in pos_response and pos_response["data"] is not None:
+            self.segment_paused_position = pos_response["data"]
+            if self.selected_segment_index is not None:
+                selected_segment = self.segment_manager.get_segment_by_index(
+                    self.selected_segment_index
+                )
+                if selected_segment:
+                    self.seg_current_pos = (
+                        self.segment_paused_position - selected_segment.start_time
+                    )
+
+        selected_indices = self.player.segment_listbox.curselection()
+        if selected_indices:
+            self.segment_paused_selection = list(sorted(selected_indices))
+
+        if self.segment_playback_timer:
+            self.player.root.after_cancel(self.segment_playback_timer)
+            self.segment_playback_timer = None
+
+        self.player.segment_play_pause_button.config(text="Play segment")
+        self.player.status_label.config(text="Segment playback paused")
+        self.player.update_time_display()
+        self.player.update_segment_time_display()
+        self.player.update_current_playing_segment_label()
+
+    def toggle_play_pause(self) -> None:
+        """Toggle between playing and pausing segment playback."""
+        if self.segment_is_playing:
+            self.pause_segment()
+        else:
+            self.play_segment()
+
+    def previous_segment(self) -> None:
+        """Navigate to the previous segment."""
+        selected_indices = self.player.segment_listbox.curselection()
+        if not selected_indices:
+            return
+
+        sorted_indices = sorted(selected_indices)
+        first_selected = sorted_indices[0]
+
+        if first_selected == 0:
+            self.player.status_label.config(
+                text="Currently at the first segment, cannot go to previous"
+            )
+            return
+
+        target_index = first_selected - 1
+        self.player.segment_listbox.selection_clear(0, tk.END)
+        self.player.segment_listbox.selection_set(target_index)
+        self.player.segment_listbox.see(target_index)
+        self.player._update_segment_timeline_label(target_index)
+
+        if self.segment_is_playing:
+            target_segment = self.segment_manager.get_segment_by_index(target_index)
+            if target_segment:
+                self.selected_segment_index = target_index
+                self.seg_current_pos = 0.0
+                self.selected_segments_to_play = [target_segment]
+                self.current_segment_index = 0
+            self._seek_to_segment_start(target_index)
+            self._start_playback()
+            self.player.update_time_display()
+        else:
+            self.segment_paused_selection = None
+            self.segment_paused_position = None
+
+        self.player.status_label.config(text=f"Moved to segment {target_index + 1}")
+        self.player.redraw_progress_display()
+        self.player.update_current_playing_segment_label()
+
+    def next_segment(self) -> None:
+        """Navigate to the next segment."""
+        selected_indices = self.player.segment_listbox.curselection()
+        if not selected_indices:
+            return
+
+        sorted_indices = sorted(selected_indices)
+        last_selected = sorted_indices[-1]
+        total_segments = self.segment_manager.get_segment_count()
+
+        if last_selected >= total_segments - 1:
+            self.player.status_label.config(
+                text="Currently at the last segment, cannot go to next"
+            )
+            return
+
+        target_index = last_selected + 1
+        self.player.segment_listbox.selection_clear(0, tk.END)
+        self.player.segment_listbox.selection_set(target_index)
+        self.player.segment_listbox.see(target_index)
+        self.player._update_segment_timeline_label(target_index)
+
+        if self.segment_is_playing:
+            target_segment = self.segment_manager.get_segment_by_index(target_index)
+            if target_segment:
+                self.selected_segment_index = target_index
+                self.seg_current_pos = 0.0
+                self.selected_segments_to_play = [target_segment]
+                self.current_segment_index = 0
+            self._seek_to_segment_start(target_index)
+            self._start_playback()
+            self.player.update_time_display()
+        else:
+            self.segment_paused_selection = None
+            self.segment_paused_position = None
+
+        self.player._update_segment_timeline_label(target_index)
+        self.player.status_label.config(text=f"Moved to segment {target_index + 1}")
+        self.player.redraw_progress_display()
+        self.player.update_current_playing_segment_label()
+
+    def seek_in_segment(self, offset: float) -> None:
+        """Seek forward/backward within the current segment."""
+        selected_indices = self.player.segment_listbox.curselection()
+        if not selected_indices:
+            return
+
+        current_idx = selected_indices[0]
+        segment = self.segment_manager.get_segment_by_index(current_idx)
+        if not segment:
+            return
+
+        # Ensure mpv is running
+        if (
+            not self.player.playback_controller.process
+            or self.player.playback_controller.process.poll() is not None
+        ):
+            self._ensure_mpv_running()
+
+        pos_response = self.player.playback_controller.send_command(
+            {"command": ["get_property", "time-pos"]}
+        )
+        if (
+            not pos_response
+            or "data" not in pos_response
+            or pos_response["data"] is None
+        ):
+            return
+
+        current_pos = pos_response["data"]
+        new_pos = max(segment.start_time, min(segment.end_time, current_pos + offset))
+
+        self._seek_to(new_pos)
+
+        # Update seg_current_pos after seek (use scheduled update to avoid blocking GUI)
+        self.player.root.after(100, self._update_after_seek, segment)
+
+    def _ensure_mpv_running(self) -> None:
+        """Ensure mpv process is running."""
+        if (
+            not self.player.playback_controller.process
+            or self.player.playback_controller.process.poll() is not None
+        ):
+            self.player.playback_controller.start_playback()
+            time.sleep(1.5)
+
+    def _seek_to(self, position: float) -> None:
+        """Seek to a specific position."""
+        self.player.playback_controller.send_command(
+            {"command": ["seek", position, "absolute"]}
+        )
+
+    def _update_after_seek(self, segment) -> None:
+        """Update seg_current_pos after seek."""
+        pos_response = self.player.playback_controller.send_command(
+            {"command": ["get_property", "time-pos"]}
+        )
+        if pos_response and "data" in pos_response and pos_response["data"] is not None:
+            actual_pos = pos_response["data"]
+            self.seg_current_pos = actual_pos - segment.start_time
+            self.player.current_pos = actual_pos
+            if not self.segment_is_playing:
+                self.segment_paused_position = actual_pos
+            self.player.update_time_display()
+
+    def _seek_to_segment_start(self, segment_index: int) -> None:
+        """Seek to the start of a segment."""
+        segment = self.segment_manager.get_segment_by_index(segment_index)
+        if segment:
+            self._seek_to(segment.start_time)
+
+    def _start_playback(self) -> None:
+        """Start or resume playback."""
+        self.player.playback_controller.send_command(
+            {"command": ["set_property", "pause", False]}
+        )
+        self.segment_is_playing = True
+        self.player.segment_play_pause_button.config(text="Pause segment")
+        self.player.update_current_playing_segment_label()
+
+        if self.segment_playback_timer:
+            self.player.root.after_cancel(self.segment_playback_timer)
+
+        self._monitor_playback()
+
+    def _monitor_playback(self) -> None:
+        """Monitor playback progress and handle segment transitions."""
+        if not self.segment_is_playing:
+            return
+
+        pos_response = self.player.playback_controller.send_command(
+            {"command": ["get_property", "time-pos"]}
+        )
+        if (
+            not pos_response
+            or "data" not in pos_response
+            or pos_response["data"] is None
+        ):
+            self.segment_playback_timer = self.player.root.after(
+                100, self._monitor_playback
+            )
+            return
+
+        current_pos = pos_response["data"]
+        current_segment = self.selected_segments_to_play[self.current_segment_index]
+
+        self.seg_current_pos = current_pos - current_segment.start_time
+        self.selected_segment_index = current_segment.index
+
+        if current_pos >= current_segment.end_time:
+            if self.current_segment_index >= len(self.selected_segments_to_play) - 1:
+                self._finish_playback()
+            else:
+                self._move_to_next_segment()
+        else:
+            self.player.update_time_display()
+            self.segment_playback_timer = self.player.root.after(
+                100, self._monitor_playback
+            )
+
+    def _move_to_next_segment(self) -> None:
+        """Move to the next segment in the sequence."""
+        self.current_segment_index += 1
+
+        if self.current_segment_index >= len(self.selected_segments_to_play):
+            self._finish_playback()
+            return
+
+        next_segment = self.selected_segments_to_play[self.current_segment_index]
+        self.selected_segment_index = next_segment.index
+        self._last_playing_segment_index = next_segment.index
+        self.player._update_segment_timeline_label(next_segment.index)
+        self.seg_current_pos = 0.0
+
+        # Restore the original multi-selection but also show current playing segment
+        if hasattr(self, "_original_selection") and self._original_selection:
+            self.player.segment_listbox.selection_clear(0, tk.END)
+            for idx in self._original_selection:
+                self.player.segment_listbox.selection_set(idx)
+        # Always ensure the current playing segment is visible
+        self.player.segment_listbox.see(next_segment.index)
+
+        self._seek_to(next_segment.start_time)
+        self._start_playback()
+        self.player.update_time_display()
+
+    def _finish_playback(self) -> None:
+        """Finish playback when all segments have been played."""
+        self.segment_is_playing = False
+        self.segment_paused_selection = None
+        self._last_playing_segment_index = None
+
+        if self.segment_playback_timer:
+            self.player.root.after_cancel(self.segment_playback_timer)
+            self.segment_playback_timer = None
+
+        # Check if we should repeat
+        if self.remaining_repeats > 1:
+            # More repeats remaining - pause the player
+            self.player.playback_controller.send_command(
+                {"command": ["set_property", "pause", True]}
+            )
+            self.player.status_label.config(
+                text=f"Waiting {self.repeat_interval}s to repeat..."
+            )
+            # Cancel any existing repeat timer
+            if self.repeat_timer:
+                self.player.root.after_cancel(self.repeat_timer)
+            # Schedule repeat after interval
+            self.repeat_timer = self.player.root.after(
+                self.repeat_interval * 1000, self._start_repeat_playback
+            )
+            return
+        elif self.remaining_repeats == 1:
+            # Last repeat, just pause
+            self.remaining_repeats = 0
+            self.segment_paused_position = None
+
+            if self.selected_segments_to_play:
+                last_segment = self.selected_segments_to_play[-1]
+                self.seg_current_pos = last_segment.end_time - last_segment.start_time
+            else:
+                self.seg_current_pos = 0.0
+
+            self.player.playback_controller.send_command(
+                {"command": ["set_property", "pause", True]}
+            )
+            self.player.segment_play_pause_button.config(text="Play segment")
+            self.player.status_label.config(text=f"All repeats completed")
+            self.player.update_time_display()
+            return
+
+        # No repeat, just finish
+        self.segment_paused_position = None
+
+        if self.selected_segments_to_play and self.current_segment_index < len(
+            self.selected_segments_to_play
+        ):
+            last_segment = self.selected_segments_to_play[self.current_segment_index]
+            self.seg_current_pos = last_segment.end_time - last_segment.start_time
+        else:
+            self.seg_current_pos = 0.0
+
+        self.player.playback_controller.send_command(
+            {"command": ["set_property", "pause", True]}
+        )
+        self.player.segment_play_pause_button.config(text="Play segment")
+        self.player.status_label.config(text="All segments played")
+        self.player.update_current_playing_segment_label()
+
+    def _start_repeat_playback(self) -> None:
+        """Start a repeat playback cycle."""
+        self.repeat_timer = None
+        self.remaining_repeats -= 1
+        self.current_segment_index = 0
+        self.seg_current_pos = 0.0
+
+        if not self.selected_segments_to_play:
+            return
+
+        first_segment = self.selected_segments_to_play[0]
+        self.selected_segment_index = first_segment.index
+        self._last_playing_segment_index = first_segment.index
+        self.player._update_segment_timeline_label(first_segment.index)
+
+        self._seek_to(first_segment.start_time)
+        self._start_playback()
+        self.player.status_label.config(
+            text=f"Repeat {self.remaining_repeats} remaining"
+        )
