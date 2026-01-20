@@ -824,6 +824,24 @@ class GUIController:
         # Apply default repeat settings on startup
         self.player.apply_repeat_settings()
 
+        # Export Segments button
+        self.player.export_segments_button = tk.Button(
+            controls_frame,
+            text="Export Segments",
+            command=self.player.export_segments,
+            takefocus=False,
+        )
+        self.player.export_segments_button.pack(fill=tk.X, pady=(5, 0))
+
+        # Export Segment LRCs button
+        self.player.export_segment_lrcs_button = tk.Button(
+            controls_frame,
+            text="Export Segment LRCs",
+            command=self.player.export_segment_lrcs,
+            takefocus=False,
+        )
+        self.player.export_segment_lrcs_button.pack(fill=tk.X, pady=(5, 0))
+
         # Framework on the right of controls with border
         extra_frame = tk.Frame(segments_frame, bd=2, relief=tk.RIDGE)
         extra_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=True)
@@ -950,6 +968,9 @@ class GUIController:
 
         # Bind space key to play segment when no input has focus
         self.player.root.bind("<KeyPress-space>", self.player.handle_space_key)
+
+        # Bind Ctrl+S to save transcription
+        self.player.root.bind('<Control-s>', lambda e: self.player.save_transcription())
 
         # Bind window close event to our cleanup function
         self.player.root.protocol("WM_DELETE_WINDOW", self.player.on_closing)
