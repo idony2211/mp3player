@@ -833,14 +833,14 @@ class GUIController:
         )
         self.player.export_segments_button.pack(fill=tk.X, pady=(5, 0))
 
-        # Export Segment LRCs button
-        self.player.export_segment_lrcs_button = tk.Button(
+        # Export Segment MDs button
+        self.player.export_segment_mds_button = tk.Button(
             controls_frame,
-            text="Export Segment LRCs",
-            command=self.player.export_segment_lrcs,
+            text="Export Segment MDs",
+            command=self.player.export_segment_mds,
             takefocus=False,
         )
-        self.player.export_segment_lrcs_button.pack(fill=tk.X, pady=(5, 0))
+        self.player.export_segment_mds_button.pack(fill=tk.X, pady=(5, 0))
 
         # Framework on the right of controls with border
         extra_frame = tk.Frame(segments_frame, bd=2, relief=tk.RIDGE)

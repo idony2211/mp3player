@@ -3077,7 +3077,7 @@ class MP3Player:
         try:
             exported_count = 0
             for i, segment in enumerate(segments, start=1):
-                output_file = os.path.join(export_dir, f"{os.path.basename(base_path)}_s{i:03d}.mp3")
+                output_file = os.path.join(export_dir, f"s{i:02d}.mp3")
                 duration = segment.end_time - segment.start_time
 
                 cmd = [
@@ -3086,7 +3086,10 @@ class MP3Player:
                     "-i", self.current_file,
                     "-ss", str(segment.start_time),
                     "-t", str(duration),
-                    "-acodec", "copy",  # Use copy to avoid re-encoding if possible
+                    "-map", "0:a",  # Map audio stream
+                    "-c:a", "libmp3lame",  # Re-encode to remove metadata
+                    "-q:a", "0",  # Highest quality VBR
+                    "-map_metadata", "-1",  # Remove all metadata
                     output_file
                 ]
 
@@ -3107,8 +3110,8 @@ class MP3Player:
             logger.error(f"Error exporting segments: {e}")
             self.status_label.config(text=f"Export error: {str(e)}")
 
-    def export_segment_lrcs(self) -> None:
-        """Export LRC files for each segment, with content starting at [00:00.00]."""
+    def export_segment_mds(self) -> None:
+        """Export MD files for each segment, with content without time tags."""
         if not self.current_file:
             logger.warning("No file loaded, cannot export")
             self.status_label.config(text="No file loaded to export")
@@ -3128,22 +3131,22 @@ class MP3Player:
         try:
             exported_count = 0
             for i, segment in enumerate(segments, start=1):
-                lrc_file = os.path.join(export_dir, f"{os.path.basename(base_path)}_s{i:03d}.lrc")
+                md_file = os.path.join(export_dir, f"s{i:02d}.md")
                 content = segment.content if segment.content else "[Instrumental]"
 
-                with open(lrc_file, "w", encoding="utf-8") as f:
-                    f.write(f"[00:00.00]{content}\n")
+                with open(md_file, "w", encoding="utf-8") as f:
+                    f.write(f"{content}\n")
 
                 exported_count += 1
-                logger.info(f"Exported LRC for segment {i} to {lrc_file}")
+                logger.info(f"Exported MD for segment {i} to {md_file}")
 
             if exported_count > 0:
-                self.status_label.config(text=f"Exported {exported_count} LRC files to {os.path.basename(export_dir)}/")
+                self.status_label.config(text=f"Exported {exported_count} MD files to {os.path.basename(export_dir)}/")
             else:
-                self.status_label.config(text="Failed to export any LRC files")
+                self.status_label.config(text="Failed to export any MD files")
 
         except Exception as e:
-            logger.error(f"Error exporting LRC files: {e}")
+            logger.error(f"Error exporting MD files: {e}")
             self.status_label.config(text=f"Export error: {str(e)}")
 
     def _on_any_widget_focus_in(self, event: Optional[tk.Event] = None) -> None:
