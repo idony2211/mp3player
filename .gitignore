@@ -6,3 +6,5 @@ openspec/
 AGENTS.md
 New Empty File
 *.zip
+__pycache__/
+*.pyc
