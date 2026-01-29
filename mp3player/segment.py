@@ -130,31 +130,78 @@ class SegmentManager:
 
         sorted_markers = sorted(markers, key=lambda m: m["time"])
 
-        existing_content = {seg.index: seg.content for seg in self.segments}
-        logger.info(
-            f"_calculate_segments: preserving content for {len(existing_content)} segments: {existing_content}"
-        )
-
+        existing_segments = self.segments
         self.segments = []
 
         if len(sorted_markers) < 2:
             logger.warning("Not enough markers to create segments")
             return
 
+        used_old_segments = set()
+
         for i in range(len(sorted_markers) - 1):
             start_marker = sorted_markers[i]
             end_marker = sorted_markers[i + 1]
 
             comment = start_marker.get("comment", "")
-            preserved_content = existing_content.get(i, "")
+            
+            new_start_time = start_marker["time"]
+            new_end_time = end_marker["time"]
+            
+            preserved_content = ""
+            
+            for j, old_seg in enumerate(existing_segments):
+                if j in used_old_segments:
+                    continue
+                
+                if old_seg.start_time == new_start_time and old_seg.end_time == new_end_time:
+                    preserved_content = old_seg.content
+                    used_old_segments.add(j)
+                    logger.info(
+                        f"Exact match for segment {i}: preserving content"
+                    )
+                    break
+                
+                if old_seg.start_time <= new_start_time < new_end_time <= old_seg.end_time:
+                    if new_start_time == old_seg.start_time:
+                        preserved_content = old_seg.content
+                        used_old_segments.add(j)
+                        logger.info(
+                            f"Segment split: keeping content in left segment [{new_start_time}, {new_end_time}]"
+                        )
+                        break
+            
+            for j, old_seg in enumerate(existing_segments):
+                if j in used_old_segments:
+                    continue
+                
+                if old_seg.start_time == new_start_time:
+                    for k, old_seg2 in enumerate(existing_segments):
+                        if k in used_old_segments or k == j:
+                            continue
+                        
+                        if old_seg2.end_time == new_end_time and old_seg.end_time == old_seg2.start_time:
+                            merged_content_parts = []
+                            if old_seg.content:
+                                merged_content_parts.append(old_seg.content)
+                            if old_seg2.content:
+                                merged_content_parts.append(old_seg2.content)
+                            preserved_content = "\n".join(merged_content_parts)
+                            used_old_segments.add(j)
+                            used_old_segments.add(k)
+                            logger.info(
+                                f"Segments merged: combining content from [{old_seg.start_time}, {old_seg.end_time}] and [{old_seg2.start_time}, {old_seg2.end_time}]"
+                            )
+                            break
+            
             logger.info(
-                f"Creating segment {i} with content: '{preserved_content[:50] if preserved_content else '(empty)'}...'"
+                f"Creating segment {i} from {start_marker['name']} to {end_marker['name']} with content: '{preserved_content[:50] if preserved_content else '(empty)'}...'"
             )
 
             segment = Segment(
                 index=i,
-                start_time=start_marker["time"],
-                end_time=end_marker["time"],
+                start_time=new_start_time,
+                end_time=new_end_time,
                 comment=comment,
                 content=preserved_content,
             )

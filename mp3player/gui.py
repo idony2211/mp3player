@@ -850,7 +850,7 @@ class GUIController:
         tk.Label(
             extra_frame,
             textvariable=self.player.transcription_segment_label,
-            font=("TkDefaultFont", 9, "bold"),
+            font=("TkDefaultFont", 18, "bold"),
             fg="darkgreen",
         ).pack(anchor=tk.W, padx=5, pady=0)
 
@@ -947,7 +947,7 @@ class GUIController:
             transcription_frame,
             height=25,
             width=120,
-            font=("TkDefaultFont", 16),
+            font=("TkDefaultFont", 18),
             wrap=tk.WORD,
             yscrollcommand=transcription_scrollbar.set,
         )

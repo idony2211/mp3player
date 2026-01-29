@@ -71,6 +71,7 @@ class PlaybackController:
             logger.debug(f"Cannot send command, IPC socket not available: {self.ipc_socket_path}")
             return None
 
+        client_socket = None
         try:
             logger.debug(f"Sending command: {command}")
 
@@ -93,31 +94,40 @@ class PlaybackController:
                 response += chunk
 
             client_socket.close()
+            client_socket = None
 
-            # Parse the response
+            # Parse the response - handle multiple JSON objects
             response_str = response.decode('utf-8').strip()
             if response_str:
-                parsed_response = json.loads(response_str)
-                logger.debug(f"Command response: {parsed_response}")
-                return parsed_response
+                # Split by newlines and take the last complete JSON response
+                lines = response_str.split('\n')
+                for line in reversed(lines):
+                    line = line.strip()
+                    if line:
+                        try:
+                            parsed_response = json.loads(line)
+                            logger.debug(f"Command response: {parsed_response}")
+                            return parsed_response
+                        except json.JSONDecodeError:
+                            continue  # Try the next line
+                logger.debug(f"Could not parse any valid JSON from response: {response_str}")
+                return {"error": "invalid_json_response"}
             else:
                 logger.debug("Empty response received")
                 return {"error": "empty_response"}
 
         except socket.timeout:
             logger.error("IPC command timed out")
-            try:
-                client_socket.close()
-            except:
-                pass  # Socket might already be closed
             return {"error": "socket_timeout"}
         except Exception as e:
             logger.error(f"Error sending command: {e}")
-            try:
-                client_socket.close()
-            except:
-                pass  # Socket might already be closed
             return {"error": str(e)}
+        finally:
+            if client_socket:
+                try:
+                    client_socket.close()
+                except:
+                    pass  # Socket might already be closed
 
     def send_command_with_retry(self, command: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
         """Send a command to mpv with retry logic."""

@@ -476,7 +476,7 @@ class MP3Player:
             if segment:
                 self._update_segment_timeline_label(first_idx)
                 if len(selection) == 1:
-                    segment_name = f"Segment {first_idx + 1}: {self.format_time(segment.start_time)} - {self.format_time(segment.end_time)}"
+                    segment_name = f"Segment {first_idx + 1} [{self.format_time(segment.start_time)} - {self.format_time(segment.end_time)}]"
                     self.transcription_segment_label.set(segment_name)
                     self.status_label.config(
                         text=f"Selected segment {segment.index + 1}: {self.format_time(segment.start_time)} - {self.format_time(segment.end_time)}"
@@ -823,12 +823,6 @@ class MP3Player:
                 content = segment.content if segment.content else "(empty)"
                 self.transcription_text.delete(1.0, tk.END)
                 self.transcription_text.insert(tk.END, content)
-
-                # Update the segment label
-                sorted_markers = sorted(self.marker_manager.markers, key=lambda m: m["time"])
-                start_marker_name = sorted_markers[index]["name"] if index < len(sorted_markers) else "Unknown"
-                end_marker_name = sorted_markers[index + 1]["name"] if (index + 1) < len(sorted_markers) else "Unknown"
-                self.transcription_segment_label.set(f"Transcription (Seg{index + 1}: {start_marker_name}-{end_marker_name})")
 
                 logger.info(f"Segment UI updated for segment {index + 1} by selector (playback unchanged)")
 

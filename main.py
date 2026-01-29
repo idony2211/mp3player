@@ -13,7 +13,13 @@ import logging
 os.environ["TORCH_LOAD_WEIGHTS_ONLY"] = "False"
 os.environ["HF_HUB_DISABLE_XDG_CACHE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
+
+# Respect HF_HUB_OFFLINE_OVERRIDE if set (this must be done before importing faster_whisper_transcriber)
+if os.environ.get("HF_HUB_OFFLINE_OVERRIDE") is not None:
+    os.environ["HF_HUB_OFFLINE"] = os.environ["HF_HUB_OFFLINE_OVERRIDE"]
+else:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 from mp3player.player import MP3Player
